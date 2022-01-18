@@ -54,7 +54,7 @@ class VariationalAutoencoder(nn.Module):
         log_p_z = self._prior.log_prob(latents)
 
         # Compute log prob of inputs under the decoder,
-        inputs = utils.repeat_rows(inputs, num_reps=num_samples)
+        inputs = [utils.repeat_rows(i, num_reps=num_samples) for i in inputs]
         log_p_x = self._likelihood.log_prob(inputs, context=latents)
 
         # Compute ELBO.

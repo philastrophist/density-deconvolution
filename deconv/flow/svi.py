@@ -109,6 +109,8 @@ class SVIFlow(MAFlow):
 
             train_loss = 0.0
 
+            torch.set_default_tensor_type(torch.FloatTensor)
+
             for j, d in enumerate(loader):
 
                 d = [a.to(self.device) for a in d]
