@@ -226,7 +226,7 @@ class SVIFlow(MAFlow):
         log_p_z = self.model._prior.log_prob(samples)
 
         # Compute log prob of inputs under the decoder,
-        x = utils.repeat_rows(x, num_reps=num_samples)
+        x = [utils.repeat_rows(_x, num_reps=num_samples) for _x in x]
         log_p_x = self.model._likelihood.log_prob(x, context=samples)
 
         # Compute ELBO.
