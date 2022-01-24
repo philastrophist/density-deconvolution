@@ -46,12 +46,12 @@ class VariationalAutoencoder(nn.Module):
         latents, log_q_z = self._approximate_posterior.sample_and_log_prob(
             num_samples,
             context=posterior_context
-        )
+        )  # latents = "true `v` samples", known as `z` here
         latents = utils.merge_leading_dims(latents, num_dims=2)
         log_q_z = utils.merge_leading_dims(log_q_z, num_dims=2)
 
         # Compute log prob of latents under the prior.
-        log_p_z = self._prior.log_prob(latents)
+        log_p_z = self._prior.log_prob(latents)  # prior is/becomes the model
 
         # Compute log prob of inputs under the decoder,
         inputs = [utils.repeat_rows(i, num_reps=num_samples) for i in inputs]
@@ -68,7 +68,7 @@ class VariationalAutoencoder(nn.Module):
 
     def log_prob_lower_bound(self, inputs, num_samples=100):
         elbo = self.stochastic_elbo(inputs, num_samples=num_samples, keepdim=True)
-        log_prob_lower_bound = torch.logsumexp(elbo, dim=1) - torch.log(torch.Tensor([num_samples]))
+        log_prob_lower_bound = torch.logsumexp(elbo, dim=1) - torch.log(torch.tensor([num_samples], device=elbo.device))
         return log_prob_lower_bound
 
     def _decode(self, latents, mean):

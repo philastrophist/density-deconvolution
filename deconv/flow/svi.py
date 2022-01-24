@@ -4,14 +4,23 @@ from torch.nn.utils import clip_grad_norm_
 
 from nflows import flows, transforms, utils
 from nflows.distributions import ConditionalDiagonalNormal, StandardNormal
+from tqdm import tqdm
 
 from .distributions import DeconvGaussian
 from .maf import MAFlow
 from .nn import DeconvInputEncoder
 from .vae import VariationalAutoencoder
-
-
 from ..utils.sampling import minibatch_sample
+
+
+def seed_worker(worker_id):
+    import numpy as np
+    import random
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
 
 class SVIFlow(MAFlow):
 
@@ -78,20 +87,41 @@ class SVIFlow(MAFlow):
         )
         return f
 
+    def fit(self, data, val_data=None, show_bar=True, seed=None):
+        for i in self.iter_fit(data, val_data, show_bar, seed):
+            pass
 
-    def fit(self, data, val_data=None):
+    def undo_bad_step(self, epoch, scheduler, previous_state, previous_d, next_d):
+        check = map(lambda x: torch.isnan(x).any().cpu().numpy(), self.model.parameters(recurse=True))
+        if any(check):
+            print(f'nan parameter encountered at {epoch}')
+            self.model.load_state_dict(previous_state)
+            scheduler._reduce_lr(epoch)
+            scheduler._reset()
+            return previous_d
+        return next_d
+
+    def iter_fit(self, data, val_data=None, show_bar=True, seed=None, use_cuda=False):
 
         optimiser = torch.optim.Adam(
             params=self.model.parameters(),
             lr=self.lr
         )
+        g, worker_init_fn = None, None
+        if seed is not None:
+            g = torch.Generator()
+            g.manual_seed(seed)
+            worker_init_fn = seed_worker
+
 
         loader = data_utils.DataLoader(
             data,
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=4,
-            pin_memory=True
+            pin_memory=use_cuda,
+            generator=g,
+            worker_init_fn=worker_init_fn
         )
 
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -102,62 +132,66 @@ class SVIFlow(MAFlow):
             verbose=True,
             threshold=1e-6
         )
-        
-        for i in range(self.epochs):
-
-            self.model.train()
-
-            train_loss = 0.0
-
-            torch.set_default_tensor_type(torch.FloatTensor)
-
-            for j, d in enumerate(loader):
-
-                d = [a.to(self.device) for a in d]
-
-                optimiser.zero_grad()
-
-                torch.set_default_tensor_type(torch.cuda.FloatTensor)
-                
-                if self.use_iwae:
-                    objective = self.model.log_prob_lower_bound(
-                        d,
-                        num_samples=self.n_samples
-                    )
-                else:
-                    objective = self.model.stochastic_elbo(
-                        d,
-                        num_samples=self.n_samples
-                    )
+        bar = tqdm(range(self.epochs), disable=not show_bar, unit='epochs', smoothing=1)
+        train_loss = 0.0
+        previous_state = self.model.state_dict()
+        previous_d = None
+        for iepoch in bar:
+            try:
+                self.model.train()
+                train_loss = 0.0
                 torch.set_default_tensor_type(torch.FloatTensor)
 
-                train_loss += torch.sum(objective).item()
-                loss = -1 * torch.mean(objective)
-                loss.backward()
-                if self.grad_clip_norm is not None:
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(),
-                        self.grad_clip_norm
-                    )
-                optimiser.step()
-                
-            train_loss /= len(data)
-            
-            if val_data:
-                val_loss = self.score_batch(
-                    val_data,
-                    log_prob=self.use_iwae,
-                    num_samples=self.n_samples
-                ) / len(val_data)
-                print('Epoch {}, Train Loss: {}, Val Loss: {}'.format(
-                    i,
-                    train_loss,
-                    val_loss
-                ))
-                scheduler.step(val_loss)
-            else:
-                print('Epoch {}, Train Loss: {}'.format(i, train_loss))
-                scheduler.step(train_loss)
+                for j, d in enumerate(loader):
+                    # if the last step resulted in nan params, reset state to the one before and try again at a lower lr
+                    d = self.undo_bad_step(iepoch, scheduler, previous_state, previous_d, d)
+                    d = [a.to(self.device) for a in d]
+
+                    optimiser.zero_grad()
+                    if use_cuda:
+                        torch.set_default_tensor_type(torch.cuda.FloatTensor)
+
+                    if self.use_iwae:
+                        objective = self.model.log_prob_lower_bound(
+                            d,
+                            num_samples=self.n_samples
+                        )
+                    else:
+                        objective = self.model.stochastic_elbo(
+                            d,
+                            num_samples=self.n_samples
+                        )
+                    torch.set_default_tensor_type(torch.FloatTensor)
+
+                    train_loss += torch.sum(objective).item()
+                    loss = -1 * torch.mean(objective)
+                    loss.backward()
+                    if self.grad_clip_norm is not None:
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(),
+                            self.grad_clip_norm
+                        )
+                    optimiser.step()
+                    previous_d = d
+
+                train_loss /= len(data)
+
+                if val_data:
+                    val_loss = self.score_batch(
+                        val_data,
+                        log_prob=self.use_iwae,
+                        num_samples=self.n_samples
+                    ) / len(val_data)
+                    bar.desc = f'loss[train|val]: {train_loss:.4f} | {val_loss:.4f}'
+                    scheduler.step(val_loss)
+                else:
+                    bar.desc = f'loss[train]: {train_loss:.4f}'
+                    scheduler.step(train_loss)
+                previous_state = self.model.state_dict()
+                yield self, train_loss
+            except KeyboardInterrupt:
+                yield self, train_loss
+                return
 
     def score(self, data, log_prob=False, num_samples=None):
         

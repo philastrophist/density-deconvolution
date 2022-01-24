@@ -107,6 +107,7 @@ for k, params in param_sets.items():
     for i in (1, 10, 25, 50):
         print('Processing K: {}'.format(i))
         for p in params[i]:
+
             svi.model.load_state_dict(torch.load(p))
             with torch.no_grad():
                 svi.model.eval()

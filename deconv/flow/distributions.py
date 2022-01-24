@@ -24,7 +24,7 @@ class DeconvGaussian(distributions.Distribution):
 
     def log_prob(self, inputs, context):
 
-        X, noise_l = inputs
+        X, noise_l = inputs  # observed data
 
         return MultivariateNormal(loc=context, scale_tril=noise_l).log_prob(X)
 
