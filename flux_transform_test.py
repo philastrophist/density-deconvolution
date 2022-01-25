@@ -34,7 +34,7 @@ def jacobianBatch(f, x):
 #
 
 sns.set()
-SEED = 1234
+SEED = 123
 set_seed(SEED)
 
 
@@ -59,8 +59,12 @@ covars = torch.Tensor([
     ]
 ])
 
+def plane_warp(x):
+    x = x.T
+    return torch.stack([torch.sinh(x[0]), x[1]]).T
+
 # make a true underlying distribution in data space
-Zfitting = torch.distributions.MultivariateNormal(loc=means, covariance_matrix=covars).sample((1000,)).reshape((-1, 2))
+Zfitting = plane_warp(torch.distributions.MultivariateNormal(loc=means, covariance_matrix=covars).sample((1000,)).reshape((-1, 2)))
 idx = torch.randperm(Zfitting.shape[0])
 Zfitting = Zfitting[idx]
 
@@ -69,21 +73,21 @@ Zfitting = Zfitting[idx]
 def data2fitting(x):
     x = x.T
     return x.T
-    # return torch.stack([torch.asinh(x[0] - 0), x[1]]).T
-    # return torch.stack([x[0], x[1]]).T
+    # return torch.stack([torch.asinh(x[0]), x[1]]).T
+    # return torch.stack([x[0]*2., x[1]]).T
 
 def fitting2data(x):
     x = x.T
     return x.T
-    # return torch.stack([torch.sinh(x[0] + 0), x[1]]).T
-    # return torch.stack([x[0], x[1]]).T
+    # return torch.stack([torch.sinh(x[0]), x[1]]).T
+    # return torch.stack([x[0]/2., x[1]]).T
 
 Zdata = fitting2data(Zfitting)
 
 # uncertainties in data space
 S = torch.Tensor([
-    [0.1, 0],
-    [0, 0.1]
+    [0.001, 0],
+    [0, 0.001]
 ])
 noise = torch.distributions.MultivariateNormal(loc=torch.Tensor([0.0, 0.0]), covariance_matrix=S).sample((Zdata.shape[0],))
 
@@ -142,12 +146,12 @@ class MySVIFlow(SVIFlow):
 
 svi = MySVIFlow(
     2,
-    7,
+    10,
     device=torch.device('cpu'),
-    batch_size=256,
+    batch_size=128,
     epochs=100,
-    lr=1e-4,
-    n_samples=50,
+    lr=1e-5,
+    n_samples=100,
     use_iwae=True
 )
 
@@ -157,6 +161,7 @@ train_data = DeconvDataset(X_train, torch.cholesky(S.repeat(X_train.shape[0], 1,
 
 fig, axs = plt.subplots(2, 2, sharex='row', sharey='row')
 axins = inset_axes(axs[0, 1], width='40%', height='40%')
+axins2 = axins.twinx()
 
 iterations = enumerate(svi.iter_fit(train_data, seed=SEED))  # iterator()
 
@@ -173,7 +178,7 @@ loss_dir.mkdir(parents=True, exist_ok=True)
 params_dir.mkdir(parents=True, exist_ok=True)
 
 
-mean = np.array([[3.0, 0.0], [0.0, 0.0]])
+mean = np.array([[10.0, 0.0], [0.0, 0.0], [30, 3], [30, -3]])
 cov = np.array([
     [
         [0.1, 0],
@@ -182,13 +187,21 @@ cov = np.array([
     [
         [0.1, 0],
         [0, 3]
+    ],
+    [
+        [0.5, 0],
+        [0, 0.5]
+    ],
+    [
+        [0.5, 0],
+        [0, 0.5]
     ]
 ])
 
 from deconv.gmm.plotting import plot_covariance
 test_point = [
     torch.Tensor(mean).to(svi.device),
-    torch.cholesky(torch.Tensor(cov)).to(svi.device)
+    vmap(torch.cholesky)(torch.Tensor(cov)).to(svi.device)
 ]
 
 def animate(o):
@@ -199,7 +212,7 @@ def animate(o):
     Ydata = fitting2data(Yfitting)
 
     Qfitting = _svi.resample_posterior(test_point, 10000)
-    Qdata = fitting2data(Qfitting)
+    Qdata = fitting2data(Qfitting.reshape(-1, Qfitting.shape[-1])).reshape(Qfitting.shape)
 
     # Draw x and y lists
     for ax in np.ravel(axs):
@@ -212,16 +225,11 @@ def animate(o):
     axs[1, 0].scatter(*Yfitting.T.cpu().numpy(), s=1, label='flow', alpha=0.5)
     axs[1, 0].set_title('model - fitting space')
 
-    axs[0, 1].scatter(*Qdata.T.cpu().numpy(), s=1)
-    plot_covariance(
-        mean[0],
-        cov[0],
-        ax=axs[0, 1],
-        color='r'
-    )
+    for qf, qd, m, c in zip(Qfitting, Qdata, mean, cov):
+        axs[1, 1].scatter(*qf.T.cpu().numpy(), s=1)
+        pnts = axs[0, 1].scatter(*qd.T.cpu().numpy(), s=1)
+        plot_covariance(m, c, ax=axs[0, 1], color=pnts.get_facecolors()[0])
     axs[0, 1].set_title('approx post. - data space')
-
-    axs[1, 1].scatter(*Qfitting.T.cpu().numpy(), s=1)
     axs[1, 1].set_title('approx post. - fitting space')
 
     axs[1, 1].set_xlim(fitting_lims[0])
@@ -229,11 +237,24 @@ def animate(o):
 
     axs[0, 0].set_xlim(data_lims[0])
     axs[0, 0].set_ylim(data_lims[1])
+    #
+    # axins.clear()
+    # axins.plot(losses)
+    # axins.set_ylim([min(losses), max(losses)])
+    # axins.set_xscale('log')
 
     axins.clear()
-    axins.plot(losses)
-    axins.set_ylim([min(losses), max(losses)])
+    axins2.clear()
+    _losses = np.array(losses)[-20:]
+    # diffs = (_losses[1:] - _losses[:-1]) / np.abs(_losses[:-1])
+    if len(losses):
+        axins.plot(losses)
+        axins.set_ylim([min(losses), max(losses)])
+    # if len(diffs):
+    #     axins2.plot(diffs)
+    #     axins2.set_ylim([min(diffs), max(diffs)])
     axins.set_xscale('log')
+
 
     fig.savefig(space_dir / f'{i}.png')
 

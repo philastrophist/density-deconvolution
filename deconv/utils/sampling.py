@@ -5,7 +5,7 @@ import torch
 def minibatch_sample(sample_f, num_samples, dimensions, batch_size, device=torch.device('cpu'), context=None, x=None):
     
     if x is not None:
-        ld = len(x)
+        ld = x[0].shape[0]
     elif context is not None:
         ld = context.shape[0]
     else:
@@ -18,8 +18,8 @@ def minibatch_sample(sample_f, num_samples, dimensions, batch_size, device=torch
         stop = (i + 1) * batch_size
         n = min(batch_size, num_samples - start)
         if x is None:
-            samples[:, start:stop, :] = sample_f(n, context=context).to(device)
+            samples[:, start:stop, :] = torch.atleast_3d(sample_f(n, context=context).to(device).T).T
         else:
-            samples[:, start:stop, :] = sample_f(x, n, context=context).to(device)
+            samples[:, start:stop, :] = torch.atleast_3d(sample_f(x, n, context=context).to(device).T).T
         
     return samples

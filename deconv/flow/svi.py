@@ -272,7 +272,7 @@ class SVIFlow(MAFlow):
         idx = torch.distributions.Categorical(logits=log_w).sample([num_samples])
         
         return samples[
-            torch.arange(len(x), device=self.device)[:, None, None],
+            torch.arange(samples.shape[0], device=self.device)[:, None, None],
             idx.T[:, :, None],
             torch.arange(self.dimensions, device=self.device)[None, None, :]
         ]
