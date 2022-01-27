@@ -9,7 +9,7 @@ from deconv.gmm.sgd_deconv_gmm import SGDDeconvGMM
 from deconv.gmm.plotting import plot_covariance
 from deconv.flow.svi import SVIFlow
 
-from deconv.experiments.checks.data import generate_data
+#from deconv.experiments.checks.data import generate_data
 
 sns.set()
 

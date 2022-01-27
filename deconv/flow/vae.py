@@ -47,6 +47,10 @@ class VariationalAutoencoder(nn.Module):
             num_samples,
             context=posterior_context
         )  # latents = "true `v` samples", known as `z` here
+        mask = torch.isnan(latents)
+        latents[mask] = 1.
+        # latents = torch.where(mask, torch.ones_like(latents), latents)
+
         latents = utils.merge_leading_dims(latents, num_dims=2)
         log_q_z = utils.merge_leading_dims(log_q_z, num_dims=2)
 
@@ -61,10 +65,15 @@ class VariationalAutoencoder(nn.Module):
         # TODO: maybe compute KL analytically when possible?
         elbo = log_p_x + kl_multiplier * (log_p_z - log_q_z)
         elbo = utils.split_leading_dim(elbo, [-1, num_samples])
+        elbo[torch.isnan(elbo)] = -torch.inf
         if keepdim:
+            elbo[mask.any(axis=-1)] = -torch.inf
+            # elbo = torch.where(mask.any(axis=-1), torch.ones_like(elbo) * -torch.inf, elbo)
             return elbo
         else:
-            return torch.sum(elbo, dim=1) / num_samples  # Average ELBO across samples.
+            average = torch.sum(elbo, dim=1) / num_samples  # Average ELBO across samples.
+            average[mask.any(axis=-1).any(axis=-1)] = torch.finfo().min / 100
+            return average
 
     def log_prob_lower_bound(self, inputs, num_samples=100):
         elbo = self.stochastic_elbo(inputs, num_samples=num_samples, keepdim=True)

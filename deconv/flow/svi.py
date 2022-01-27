@@ -1,3 +1,6 @@
+from copy import deepcopy
+
+import numpy as np
 import torch
 import torch.utils.data as data_utils
 from torch.nn.utils import clip_grad_norm_
@@ -91,17 +94,28 @@ class SVIFlow(MAFlow):
         for i in self.iter_fit(data, val_data, show_bar, seed):
             pass
 
-    def undo_bad_step(self, epoch, scheduler, previous_state, previous_d, next_d):
-        check = map(lambda x: torch.isnan(x).any().cpu().numpy(), self.model.parameters(recurse=True))
-        if any(check):
-            print(f'nan parameter encountered at {epoch}')
-            self.model.load_state_dict(previous_state)
-            scheduler._reduce_lr(epoch)
-            scheduler._reset()
-            return previous_d
-        return next_d
+    def checkpoint_fitting(self, optimiser, scheduler):
+        previous_state = deepcopy(self.model.state_dict())
+        previous_scheduler_state = deepcopy(scheduler.state_dict())
+        previous_optimiser_state = deepcopy(optimiser.state_dict())
+        return (scheduler, optimiser, previous_state, previous_optimiser_state, previous_scheduler_state)
 
-    def iter_fit(self, data, val_data=None, show_bar=True, seed=None, use_cuda=False):
+    def is_bad_step(self, loss):
+        bad_model = any(map(lambda x: torch.isnan(x).any().cpu().numpy(), self.model.parameters(recurse=True)))
+        return bad_model or not np.isfinite(loss)
+
+    def undo_step(self, epoch, checkpoint):
+        print(f'Epoch {epoch}: model parameters got updated to NaN or resulting in invalid loss, rolling back and slowing down')
+        scheduler, optimiser, previous_state, previous_optimiser_state, previous_scheduler_state = checkpoint
+        self.model.load_state_dict(previous_state)
+        optimiser.load_state_dict(previous_optimiser_state)
+        scheduler.load_state_dict(previous_scheduler_state)
+        scheduler._reduce_lr(epoch)
+        scheduler.cooldown_counter = scheduler.cooldown
+        scheduler.num_bad_epochs = 0
+        scheduler._last_lr = [group['lr'] for group in scheduler.optimizer.param_groups]
+
+    def iter_fit(self, data, val_data=None, show_bar=True, seed=None, use_cuda=False, num_workers=4):
 
         optimiser = torch.optim.Adam(
             params=self.model.parameters(),
@@ -118,7 +132,7 @@ class SVIFlow(MAFlow):
             data,
             batch_size=self.batch_size,
             shuffle=True,
-            num_workers=4,
+            num_workers=num_workers,
             pin_memory=use_cuda,
             generator=g,
             worker_init_fn=worker_init_fn
@@ -134,8 +148,8 @@ class SVIFlow(MAFlow):
         )
         bar = tqdm(range(self.epochs), disable=not show_bar, unit='epochs', smoothing=1)
         train_loss = 0.0
-        previous_state = self.model.state_dict()
-        previous_d = None
+        checkpoint = self.checkpoint_fitting(optimiser, scheduler)
+
         for iepoch in bar:
             try:
                 self.model.train()
@@ -143,8 +157,6 @@ class SVIFlow(MAFlow):
                 torch.set_default_tensor_type(torch.FloatTensor)
 
                 for j, d in enumerate(loader):
-                    # if the last step resulted in nan params, reset state to the one before and try again at a lower lr
-                    d = self.undo_bad_step(iepoch, scheduler, previous_state, previous_d, d)
                     d = [a.to(self.device) for a in d]
 
                     optimiser.zero_grad()
@@ -172,9 +184,14 @@ class SVIFlow(MAFlow):
                             self.grad_clip_norm
                         )
                     optimiser.step()
-                    previous_d = d
-
                 train_loss /= len(data)
+
+                if self.is_bad_step(train_loss):
+                    self.undo_step(iepoch, checkpoint)
+                    checkpoint = self.checkpoint_fitting(optimiser, scheduler)
+                    continue
+                else:
+                    checkpoint = self.checkpoint_fitting(optimiser, scheduler)
 
                 if val_data:
                     val_loss = self.score_batch(
@@ -187,7 +204,6 @@ class SVIFlow(MAFlow):
                 else:
                     bar.desc = f'loss[train]: {train_loss:.4f}'
                     scheduler.step(train_loss)
-                previous_state = self.model.state_dict()
                 yield self, train_loss
             except KeyboardInterrupt:
                 yield self, train_loss
@@ -266,7 +282,9 @@ class SVIFlow(MAFlow):
         # Compute ELBO.
         log_w = log_p_x + log_p_z - log_q_z
         log_w = utils.split_leading_dim(log_w, [-1, num_samples])
+        log_w[torch.isnan(log_w)] = -torch.inf
         log_w -= torch.logsumexp(log_w, dim=-1)[:, None]
+        log_w[torch.isnan(log_w)] = -torch.inf
         
         samples = utils.split_leading_dim(samples, [-1, num_samples])
         idx = torch.distributions.Categorical(logits=log_w).sample([num_samples])

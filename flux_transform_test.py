@@ -1,3 +1,4 @@
+from copy import deepcopy
 from pathlib import Path
 
 import numpy as np
@@ -34,7 +35,7 @@ def jacobianBatch(f, x):
 #
 
 sns.set()
-SEED = 123
+SEED = 1234
 set_seed(SEED)
 
 
@@ -64,7 +65,8 @@ def plane_warp(x):
     return torch.stack([torch.sinh(x[0]), x[1]]).T
 
 # make a true underlying distribution in data space
-Zfitting = plane_warp(torch.distributions.MultivariateNormal(loc=means, covariance_matrix=covars).sample((1000,)).reshape((-1, 2)))
+# Zfitting = plane_warp(torch.distributions.MultivariateNormal(loc=means, covariance_matrix=covars).sample((5000,)).reshape((-1, 2)))
+Zfitting = torch.distributions.MultivariateNormal(loc=means, covariance_matrix=covars).sample((5000,)).reshape((-1, 2))
 idx = torch.randperm(Zfitting.shape[0])
 Zfitting = Zfitting[idx]
 
@@ -72,24 +74,31 @@ Zfitting = Zfitting[idx]
 # the first dimension is flux and is transformed to asinh mag, 2nd dim is left alone
 def data2fitting(x):
     x = x.T
-    return x.T
-    # return torch.stack([torch.asinh(x[0]), x[1]]).T
+    # return x.T
+    return torch.stack([torch.asinh(x[0]), x[1]]).T
     # return torch.stack([x[0]*2., x[1]]).T
 
 def fitting2data(x):
     x = x.T
-    return x.T
-    # return torch.stack([torch.sinh(x[0]), x[1]]).T
+    # return x.T
+    return torch.stack([torch.sinh(x[0]), x[1]]).T
     # return torch.stack([x[0]/2., x[1]]).T
 
 Zdata = fitting2data(Zfitting)
 
 # uncertainties in data space
-S = torch.Tensor([
-    [0.001, 0],
-    [0, 0.001]
-])
-noise = torch.distributions.MultivariateNormal(loc=torch.Tensor([0.0, 0.0]), covariance_matrix=S).sample((Zdata.shape[0],))
+def uncertainty(x):
+    """uncertainty covariance of a point x"""
+    S = torch.zeros((x.shape[0], x.shape[1], x.shape[1]))
+    S[:, 0, 0] = torch.abs(x[:, 0]) * 1  # i.e. scaled poisson noise std=root(flux)
+    S[:, 1, 1] = 0.4
+    return S
+# S = torch.Tensor([
+#     [0.1, 0],
+#     [0, 0.1]
+# ])
+S = uncertainty(Zdata)
+noise = torch.distributions.MultivariateNormal(loc=torch.Tensor([0.0, 0.0]), covariance_matrix=S).sample((1,))[0]
 
 # noisy data in both spaces
 Xdata = Zdata + noise
@@ -144,14 +153,15 @@ class MySVIFlow(SVIFlow):
         return DeconvGaussianTransformed(fitting2data, data2fitting)
 
 
+# bad initialisation occurs if you fit with too few points
 svi = MySVIFlow(
     2,
-    10,
+    5,
     device=torch.device('cpu'),
-    batch_size=128,
-    epochs=100,
+    batch_size=256,
+    epochs=3000,
     lr=1e-5,
-    n_samples=100,
+    n_samples=500,
     use_iwae=True
 )
 
@@ -163,7 +173,7 @@ fig, axs = plt.subplots(2, 2, sharex='row', sharey='row')
 axins = inset_axes(axs[0, 1], width='40%', height='40%')
 axins2 = axins.twinx()
 
-iterations = enumerate(svi.iter_fit(train_data, seed=SEED))  # iterator()
+iterations = enumerate(svi.iter_fit(train_data, seed=SEED, num_workers=0))  # iterator()
 
 
 losses = []
@@ -204,15 +214,25 @@ test_point = [
     vmap(torch.cholesky)(torch.Tensor(cov)).to(svi.device)
 ]
 
-def animate(o):
+start_from = 0
+if start_from > 0:
+    svi.model.load_state_dict(torch.load(params_dir / f'{start_from}.pt'))
+
+def animate_and_record(o):
     i, (_svi, loss) = o
+    i += start_from
     losses.append(loss)
     torch.save(_svi.model.state_dict(), params_dir / f'{i}.pt')
     Yfitting = _svi.sample_prior(10000)
     Ydata = fitting2data(Yfitting)
-
-    Qfitting = _svi.resample_posterior(test_point, 10000)
-    Qdata = fitting2data(Qfitting.reshape(-1, Qfitting.shape[-1])).reshape(Qfitting.shape)
+    try:
+        Qfitting = _svi.resample_posterior(test_point, 10000)
+    except ValueError:
+        print('NaNs in resampling posterior, skipping the approx posterior this iteration')
+        Qfitting = None
+        Qdata = None
+    else:
+        Qdata = fitting2data(Qfitting.reshape(-1, Qfitting.shape[-1])).reshape(Qfitting.shape)
 
     # Draw x and y lists
     for ax in np.ravel(axs):
@@ -225,18 +245,19 @@ def animate(o):
     axs[1, 0].scatter(*Yfitting.T.cpu().numpy(), s=1, label='flow', alpha=0.5)
     axs[1, 0].set_title('model - fitting space')
 
-    for qf, qd, m, c in zip(Qfitting, Qdata, mean, cov):
-        axs[1, 1].scatter(*qf.T.cpu().numpy(), s=1)
-        pnts = axs[0, 1].scatter(*qd.T.cpu().numpy(), s=1)
-        plot_covariance(m, c, ax=axs[0, 1], color=pnts.get_facecolors()[0])
+    if Qdata is not None:
+        for qf, qd, m, c in zip(Qfitting, Qdata, mean, cov):
+            axs[1, 1].scatter(*qf.T.cpu().numpy(), s=1)
+            pnts = axs[0, 1].scatter(*qd.T.cpu().numpy(), s=1)
+            plot_covariance(m, c, ax=axs[0, 1], color=pnts.get_facecolors()[0])
     axs[0, 1].set_title('approx post. - data space')
-    axs[1, 1].set_title('approx post. - fitting space')
+    axs[1, 1].set_title('`approx post. - fitting space')
 
-    axs[1, 1].set_xlim(fitting_lims[0])
-    axs[1, 1].set_ylim(fitting_lims[1])
-
-    axs[0, 0].set_xlim(data_lims[0])
-    axs[0, 0].set_ylim(data_lims[1])
+    # axs[1, 1].set_xlim(fitting_lims[0])
+    # axs[1, 1].set_ylim(fitting_lims[1])
+    #
+    # axs[0, 0].set_xlim(data_lims[0])
+    # axs[0, 0].set_ylim(data_lims[1])
     #
     # axins.clear()
     # axins.plot(losses)
@@ -247,9 +268,14 @@ def animate(o):
     axins2.clear()
     _losses = np.array(losses)[-20:]
     # diffs = (_losses[1:] - _losses[:-1]) / np.abs(_losses[:-1])
-    if len(losses):
-        axins.plot(losses)
-        axins.set_ylim([min(losses), max(losses)])
+    if len(_losses):
+        axins.plot(_losses)
+        try:
+            mn, mx = min(_losses), max(_losses)
+            buffer = (mx - mn) * 0.05
+            axins.set_ylim([mn-buffer, mx+buffer])
+        except ValueError:
+            pass
     # if len(diffs):
     #     axins2.plot(diffs)
     #     axins2.set_ylim([min(diffs), max(diffs)])
@@ -261,5 +287,15 @@ def animate(o):
 
 
 # Set up plot to call animate() function periodically
-ani = animation.FuncAnimation(fig, animate, interval=500, frames=iterations, repeat=False)
+# print(list(svi.model.parameters())[0])
+# previous = deepcopy(svi.model.state_dict())
+# next(iterations)
+# print(list(svi.model.parameters())[0])
+# svi.model.load_state_dict(previous)
+# print(list(svi.model.parameters())[0])
+
+
+ani = animation.FuncAnimation(fig, animate_and_record, interval=500, frames=iterations, repeat=False)
+# next(iterations)
+# next(iterations)
 plt.show()
