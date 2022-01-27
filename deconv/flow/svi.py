@@ -90,8 +90,8 @@ class SVIFlow(MAFlow):
         )
         return f
 
-    def fit(self, data, val_data=None, show_bar=True, seed=None):
-        for i in self.iter_fit(data, val_data, show_bar, seed):
+    def fit(self, data, val_data=None, show_bar=True, seed=None, raise_bad=False):
+        for i in self.iter_fit(data, val_data, show_bar, seed, raise_bad=raise_bad):
             pass
 
     def checkpoint_fitting(self, optimiser, scheduler):
@@ -115,7 +115,7 @@ class SVIFlow(MAFlow):
         scheduler.num_bad_epochs = 0
         scheduler._last_lr = [group['lr'] for group in scheduler.optimizer.param_groups]
 
-    def iter_fit(self, data, val_data=None, show_bar=True, seed=None, use_cuda=False, num_workers=4):
+    def iter_fit(self, data, val_data=None, show_bar=True, seed=None, use_cuda=False, num_workers=4, raise_bad=False):
 
         optimiser = torch.optim.Adam(
             params=self.model.parameters(),
@@ -187,29 +187,33 @@ class SVIFlow(MAFlow):
                 train_loss /= len(data)
 
                 if self.is_bad_step(train_loss):
+                    if raise_bad:
+                        raise ValueError(f"Bad loss or network parameters")
                     self.undo_step(iepoch, checkpoint)
                     checkpoint = self.checkpoint_fitting(optimiser, scheduler)
                     continue
                 else:
                     checkpoint = self.checkpoint_fitting(optimiser, scheduler)
-
+                val_loss = None
                 if val_data:
                     val_loss = self.score_batch(
                         val_data,
                         log_prob=self.use_iwae,
-                        num_samples=self.n_samples
+                        num_samples=self.n_samples,
+                        use_cuda=use_cuda,
+                        num_workers=num_workers
                     ) / len(val_data)
                     bar.desc = f'loss[train|val]: {train_loss:.4f} | {val_loss:.4f}'
                     scheduler.step(val_loss)
                 else:
                     bar.desc = f'loss[train]: {train_loss:.4f}'
                     scheduler.step(train_loss)
-                yield self, train_loss
+                yield self, train_loss, val_loss
             except KeyboardInterrupt:
-                yield self, train_loss
+                yield self, train_loss, val_loss
                 return
 
-    def score(self, data, log_prob=False, num_samples=None):
+    def score(self, data, log_prob=False, num_samples=None, use_cuda=False):
         
         if not num_samples:
             num_samples = self.n_samples
@@ -217,25 +221,26 @@ class SVIFlow(MAFlow):
         with torch.no_grad():
             self.model.eval()
 
-            torch.set_default_tensor_type(torch.cuda.FloatTensor)
+            if use_cuda:
+                torch.set_default_tensor_type(torch.cuda.FloatTensor)
             if log_prob:
                 return self.model.log_prob_lower_bound(data, num_samples=num_samples)
             else:
                 return self.model.stochastic_elbo(data, num_samples=num_samples)
             torch.set_default_tensor_type(torch.FloatTensor)
 
-    def score_batch(self, dataset, log_prob=False, num_samples=None):
+    def score_batch(self, dataset, log_prob=False, num_samples=None, use_cuda=False, num_workers=4):
         loader = data_utils.DataLoader(
             dataset,
             batch_size=self.batch_size,
-            num_workers=4,
-            pin_memory=True
+            num_workers=num_workers,
+            pin_memory=use_cuda,
         )
         score = 0.0
 
         for j, d in enumerate(loader):
             d = [a.to(self.device) for a in d]
-            score += torch.sum(self.score(d, log_prob, num_samples)).item()
+            score += torch.sum(self.score(d, log_prob, num_samples, use_cuda)).item()
 
         return score
 

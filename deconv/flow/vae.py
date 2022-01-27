@@ -54,12 +54,12 @@ class VariationalAutoencoder(nn.Module):
         latents = utils.merge_leading_dims(latents, num_dims=2)
         log_q_z = utils.merge_leading_dims(log_q_z, num_dims=2)
 
-        # Compute log prob of latents under the prior.
-        log_p_z = self._prior.log_prob(latents)  # prior is/becomes the model
+        # Compute log prob of latents under the prior. prior is/becomes the model
+        log_p_z = self._prior.log_prob(latents)  # produces -infs
 
         # Compute log prob of inputs under the decoder,
         inputs = [utils.repeat_rows(i, num_reps=num_samples) for i in inputs]
-        log_p_x = self._likelihood.log_prob(inputs, context=latents)
+        log_p_x = self._likelihood.log_prob(inputs, context=latents)  # produces -infs
 
         # Compute ELBO.
         # TODO: maybe compute KL analytically when possible?
