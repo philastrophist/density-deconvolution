@@ -13,6 +13,7 @@ from deconv.flow.svi import SVIFlow
 from nflows.distributions import Distribution
 from torch.distributions import MultivariateNormal
 
+torch.autograd.set_detect_anomaly(True)
 
 def set_seed(seed):
     import random
@@ -52,20 +53,15 @@ covars = torch.Tensor([
         [0, 0.1]
     ]
 ])
-
-Zreal = torch.distributions.MultivariateNormal(loc=means, covariance_matrix=covars).sample((N-(N/5),)).reshape((-1, 2))
-Zreal[:, 0] = 10**(Zreal[:, 0])  # make it into fluxes
-
-torch.concat()
-
-
-
-# make a true underlying distribution in data space
-# Zfitting = plane_warp(torch.distributions.MultivariateNormal(loc=means, covariance_matrix=covars).sample((5000,)).reshape((-1, 2)))
 N = 10_000
-Zfitting = torch.distributions.MultivariateNormal(loc=means, covariance_matrix=covars).sample((N,)).reshape((-1, 2))
-idx = torch.randperm(Zfitting.shape[0])
-Zfitting = Zfitting[idx]
+
+# this is all in data space
+Zreal = torch.distributions.MultivariateNormal(loc=means, covariance_matrix=covars).sample((N-(N//5),)).reshape((-1, 2))
+Zreal[:, 0] = 10**(Zreal[:, 0])  # make it into fluxes
+Zfake = torch.distributions.MultivariateNormal(loc=means[:1], covariance_matrix=covars[:1]).sample((N//5,)).reshape((-1, 2))
+Zdata = torch.concat([Zreal, Zfake], dim=0)
+idx = torch.randperm(Zdata.shape[0])
+Zdata = Zdata[idx]
 
 
 # the first dimension is flux and is transformed to asinh mag to get rid of huge orders of mag range, 2nd dim is left alone
@@ -81,7 +77,7 @@ def fitting2data(x):
     # return x.T
     return torch.stack([torch.sinh(x[0]), x[1]]).T
 
-Zdata = fitting2data(Zfitting)
+Zfitting = data2fitting(Zdata)
 
 # make uncertainties in data space look
 def uncertainty(x):
@@ -126,15 +122,21 @@ class DeconvGaussianTransformed(Distribution):
     """
     def __init__(self, fitting2data, data2fitting):
         super().__init__()
-        self.fitting2data = fitting2data
         self.data2fitting = data2fitting
+        self.fitting2data = fitting2data
 
-    def log_prob(self, inputs, context):
+    def temporary_use_jacobian(self, x):
+        J = torch.zeros((x.shape[0], x.shape[1], x.shape[1]))
+        J[:, 0, 0] = torch.cosh(x[:, 0])
+        J[:, 1, 1] = 1.
+        return J
+
+    def log_prob(self, inputs, context):  # TODO: will fail because you can sample very far away from the prior
         X, noise_l = inputs  # fitting space, data space
         # transform samples to the data space where the uncertainties live
-        jac = jacobianBatch(self.fitting2data, context)
+        jac = self.temporary_use_jacobian(context)  #jacobianBatch(self.fitting2data, context)
         context_transformed = self.fitting2data(context)
-        log_scaling = vmap(lambda x: torch.slogdet(x)[1])(jac)
+        log_scaling = torch.slogdet(jac)[1]
         Z = self.fitting2data(X)
         return MultivariateNormal(loc=context_transformed, scale_tril=noise_l).log_prob(Z) + log_scaling
 
@@ -168,14 +170,14 @@ svi = MySVIFlow(
     5,
     device= torch.device('cpu'),
     batch_size=2000,
-    epochs=2,
-    lr=8e-5,
+    epochs=50,
+    lr=1e-6,
     n_samples=10,
     grad_clip_norm=2,
     use_iwae=True,
 )
 iterations = enumerate(svi.iter_fit(train_data, test_data, seed=SEED, num_workers=0,
-                                    rewind_on_inf=True, return_kl_logl=True))  # iterator
+                                    rewind_on_inf=False, return_kl_logl=True))  # iterator
 
 directory = Path('svi_model')
 space_dir = directory / 'plots'
@@ -214,7 +216,7 @@ test_point = [
     vmap(torch.cholesky)(torch.Tensor(cov)).to(svi.device)
 ]
 
-start_from = 30
+start_from = 0
 if start_from > 0:
     svi.model.load_state_dict(torch.load(params_dir / f'{start_from}.pt'))
 

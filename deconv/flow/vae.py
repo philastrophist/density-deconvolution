@@ -95,7 +95,9 @@ class VariationalAutoencoder(nn.Module):
             kl = torch.logsumexp(kl, dim=1) - torch.log(torch.tensor([num_samples], device=elbo.device))
         else:
             elbo = r
-        log_prob_lower_bound = torch.logsumexp(elbo, dim=1) - torch.log(torch.tensor([num_samples], device=elbo.device))
+        mask = ~torch.all(~torch.isfinite(elbo), dim=1)
+        samples_per_row = torch.sum(~torch.isfinite(elbo), dim=1)[mask]
+        log_prob_lower_bound = torch.logsumexp(elbo[mask], dim=1) - torch.log(samples_per_row)#- torch.log(torch.tensor([num_samples], device=elbo.device))
         if separate:
             return log_prob_lower_bound, (logl, kl)
         return log_prob_lower_bound
