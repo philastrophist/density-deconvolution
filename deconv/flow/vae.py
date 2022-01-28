@@ -29,7 +29,7 @@ class VariationalAutoencoder(nn.Module):
     def forward(self, *args):
         raise RuntimeError('Forward method cannot be called for a VAE object.')
 
-    def stochastic_elbo(self, inputs, num_samples=1, kl_multiplier=1., keepdim=False):
+    def stochastic_elbo(self, inputs, num_samples=1, kl_multiplier=1., keepdim=False, separate=False):
         """Calculates an unbiased Monte-Carlo estimate of the evidence lower bound.
         Note: the KL term is also estimated via Monte Carlo.
         Args:
@@ -63,21 +63,41 @@ class VariationalAutoencoder(nn.Module):
 
         # Compute ELBO.
         # TODO: maybe compute KL analytically when possible?
-        elbo = log_p_x + kl_multiplier * (log_p_z - log_q_z)
+        kl = kl_multiplier * (log_p_z - log_q_z)
+        elbo = log_p_x + kl
         elbo = utils.split_leading_dim(elbo, [-1, num_samples])
         elbo[torch.isnan(elbo)] = -torch.inf
+
+        logl = utils.split_leading_dim(log_p_x, [-1, num_samples])
+        kl = utils.split_leading_dim(kl, [-1, num_samples])
+
         if keepdim:
             elbo[mask.any(axis=-1)] = -torch.inf
+            logl[mask.any(axis=-1)] = -torch.inf
+            kl[mask.any(axis=-1)] = -torch.inf
             # elbo = torch.where(mask.any(axis=-1), torch.ones_like(elbo) * -torch.inf, elbo)
-            return elbo
         else:
-            average = torch.sum(elbo, dim=1) / num_samples  # Average ELBO across samples.
-            average[mask.any(axis=-1).any(axis=-1)] = torch.finfo().min / 100
-            return average
+            elbo = torch.sum(elbo, dim=1) / num_samples  # Average ELBO across samples.
+            elbo[mask.any(axis=-1).any(axis=-1)] = torch.finfo().min / 100
+            logl = torch.sum(logl, dim=1) / num_samples  # Average logl across samples.
+            logl[mask.any(axis=-1).any(axis=-1)] = torch.finfo().min / 100
+            kl = torch.sum(kl, dim=1) / num_samples  # Average kl across samples.
+            kl[mask.any(axis=-1).any(axis=-1)] = torch.finfo().min / 100
+        if separate:
+            return elbo, (logl, kl)
+        return elbo
 
     def log_prob_lower_bound(self, inputs, num_samples=100, kl_multiplier=1., separate=False):
-        elbo = self.stochastic_elbo(inputs, num_samples=num_samples, kl_multiplier=kl_multiplier, keepdim=True)
+        r = self.stochastic_elbo(inputs, num_samples=num_samples, kl_multiplier=kl_multiplier, keepdim=True, separate=separate)
+        if separate:
+            elbo, (logl, kl) = r
+            logl = torch.logsumexp(logl, dim=1) - torch.log(torch.tensor([num_samples], device=elbo.device))
+            kl = torch.logsumexp(kl, dim=1) - torch.log(torch.tensor([num_samples], device=elbo.device))
+        else:
+            elbo = r
         log_prob_lower_bound = torch.logsumexp(elbo, dim=1) - torch.log(torch.tensor([num_samples], device=elbo.device))
+        if separate:
+            return log_prob_lower_bound, (logl, kl)
         return log_prob_lower_bound
 
     def _decode(self, latents, mean):

@@ -102,7 +102,7 @@ class SVIFlow(MAFlow):
 
     def is_bad_step(self, loss):
         bad_model = any(map(lambda x: torch.isnan(x).any().cpu().numpy(), self.model.parameters(recurse=True)))
-        return bad_model or not torch.isfinite(loss).cpu().numpy()
+        return bad_model or not np.isfinite(loss)
 
     def undo_step(self, epoch, checkpoint):
         print(f'Epoch {epoch}: model parameters got updated to NaN or resulting in invalid loss, rolling back and slowing down')
@@ -115,7 +115,8 @@ class SVIFlow(MAFlow):
         scheduler.num_bad_epochs = 0
         scheduler._last_lr = [group['lr'] for group in scheduler.optimizer.param_groups]
 
-    def iter_fit(self, data, val_data=None, show_bar=True, seed=None, use_cuda=False, num_workers=4, raise_bad=False):
+    def iter_fit(self, data, val_data=None, show_bar=True, seed=None, use_cuda=False, num_workers=4,
+                 raise_bad=False, return_kl_logl=False):
         optimiser = torch.optim.Adam(
             params=self.model.parameters(),
             lr=self.lr
@@ -155,6 +156,8 @@ class SVIFlow(MAFlow):
             try:
                 self.model.train()
                 train_loss = 0.0
+                logls = 0.
+                kls = 0.
                 torch.set_default_tensor_type(torch.FloatTensor)
 
                 for j, d in enumerate(loader):
@@ -165,22 +168,26 @@ class SVIFlow(MAFlow):
                         torch.set_default_tensor_type(torch.cuda.FloatTensor)
 
                     if self.use_iwae:
-                        objective = self.model.log_prob_lower_bound(
+                        objective, (logl, kl) = self.model.log_prob_lower_bound(
                             d,
                             num_samples=self.n_samples,
-                            kl_multiplier=kl_multiplier
+                            kl_multiplier=kl_multiplier,
+                            separate=True
                         )
                     else:
-                        objective = self.model.stochastic_elbo(
+                        objective, (logl, kl) = self.model.stochastic_elbo(
                             d,
                             num_samples=self.n_samples,
-                            kl_multiplier=kl_multiplier
+                            kl_multiplier=kl_multiplier,
+                            separate=True
                         )
                     torch.set_default_tensor_type(torch.FloatTensor)
 
                     minibatch_scaling = data.X.shape[0] / d[0].shape[0]
                     train_loss += torch.sum(objective * minibatch_scaling).item()
-                    loss = -1 * torch.mean(objective * minibatch_scaling)
+                    logls += torch.sum(logl * minibatch_scaling).item()
+                    kls += torch.sum(kl * minibatch_scaling).item()
+                    loss = -1 * torch.sum(objective * minibatch_scaling)  # changed to sum with minibatch scaling rather than mean
                     loss.backward()
                     if self.grad_clip_norm is not None:
                         torch.nn.utils.clip_grad_norm_(
@@ -189,6 +196,8 @@ class SVIFlow(MAFlow):
                         )
                     optimiser.step()
                 train_loss /= len(data)
+                logls /= len(data)
+                kls /= len(data)
 
                 if self.is_bad_step(train_loss):
                     if raise_bad:
@@ -207,14 +216,20 @@ class SVIFlow(MAFlow):
                         use_cuda=use_cuda,
                         num_workers=num_workers
                     ) / len(val_data)
-                    bar.desc = f'loss[train|val]: {train_loss:.4f} | {val_loss:.4f}'
+                    bar.desc = f'loss[train|val], [logl|kl]: {train_loss:.4f} | {val_loss:.4f}, {logls:.4f} | {kls:.4f}'
                     scheduler.step(val_loss)
                 else:
-                    bar.desc = f'loss[train]: {train_loss:.4f}'
+                    bar.desc = f'loss[train], [logl|kl]: {train_loss:.4f}, {logls:.4f} | {kls:.4f}'
                     scheduler.step(train_loss)
-                yield self, train_loss, val_loss
+                if return_kl_logl:
+                    yield self, train_loss, val_loss, logls, kls
+                else:
+                    yield self, train_loss, val_loss
             except KeyboardInterrupt:
-                yield self, train_loss, val_loss
+                if return_kl_logl:
+                    yield self, train_loss, val_loss, logls, kls
+                else:
+                    yield self, train_loss, val_loss
                 return
 
     def score(self, data, log_prob=False, num_samples=None, use_cuda=False):

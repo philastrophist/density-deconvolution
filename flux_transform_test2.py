@@ -53,9 +53,14 @@ covars = torch.Tensor([
     ]
 ])
 
+def plane_warp(x):
+    x = x.T
+    return torch.stack([torch.sinh(x[0]), x[1]]).T
+
+
 # make a true underlying distribution in data space
 # Zfitting = plane_warp(torch.distributions.MultivariateNormal(loc=means, covariance_matrix=covars).sample((5000,)).reshape((-1, 2)))
-N = 5000
+N = 10_000
 Zfitting = torch.distributions.MultivariateNormal(loc=means, covariance_matrix=covars).sample((N,)).reshape((-1, 2))
 idx = torch.randperm(Zfitting.shape[0])
 Zfitting = Zfitting[idx]
@@ -63,12 +68,15 @@ Zfitting = Zfitting[idx]
 
 # the first dimension is flux and is transformed to asinh mag to get rid of huge orders of mag range, 2nd dim is left alone
 # this functions transform back and forth from data plane (where uncertainties will be gaussians) and the fitting plane
+# TODO test normalising data a little better
 def data2fitting(x):
     x = x.T
+    # return x.T
     return torch.stack([torch.asinh(x[0]), x[1]]).T
 
 def fitting2data(x):
     x = x.T
+    # return x.T
     return torch.stack([torch.sinh(x[0]), x[1]]).T
 
 Zdata = fitting2data(Zfitting)
@@ -81,7 +89,8 @@ def uncertainty(x):
     S[:, 1, 1] = 0.4
     return S
 
-S = uncertainty(Zdata)
+
+S = uncertainty(Zdata) * 0.00001  # TODO: test when errors look realistic
 noise = torch.distributions.MultivariateNormal(loc=torch.Tensor([0.0, 0.0]), covariance_matrix=S).sample((1,))[0]
 
 # noisy data in both spaces
@@ -119,12 +128,13 @@ class DeconvGaussianTransformed(Distribution):
         self.data2fitting = data2fitting
 
     def log_prob(self, inputs, context):
-        X, noise_l = inputs  # observed data in the data space
+        X, noise_l = inputs  # fitting space, data space
         # transform samples to the data space where the uncertainties live
         jac = jacobianBatch(self.fitting2data, context)
         context_transformed = self.fitting2data(context)
         log_scaling = vmap(lambda x: torch.slogdet(x)[1])(jac)
-        return MultivariateNormal(loc=context_transformed, scale_tril=noise_l).log_prob(X) + log_scaling
+        Z = self.fitting2data(X)
+        return MultivariateNormal(loc=context_transformed, scale_tril=noise_l).log_prob(Z) + log_scaling
 
 
 class MySVIFlow(SVIFlow):
@@ -142,24 +152,28 @@ train_data = DeconvDataset(X_train, torch.cholesky(S_train))
 test_data = DeconvDataset(X_test, torch.cholesky(S_test))
 
 fig, axs = plt.subplots(2, 2, sharex='row', sharey='row')
-axins = inset_axes(axs[0, 1], width='40%', height='40%')
-axins2 = axins.twinx()
+axins_losses = inset_axes(axs[0, 1], width='40%', height='40%', loc='upper right')
+axins_losses2 = axins_losses.twinx()
+axins_losses2.yaxis.set_visible(True)
+axins_losses.set_ylabel('train loss')
+axins_losses2.set_ylabel('val loss')
+
+axins_logl = inset_axes(axs[0, 1], width='40%', height='40%', loc='lower right')
+axins_logl.set_ylabel('train logl,kl terms')
 
 svi = MySVIFlow(
     2,
     5,
     device= torch.device('cpu'),
     batch_size=2000,
-    epochs=100,
-    lr=1e-6,
-    n_samples=50,
+    epochs=500,
+    lr=1e-4,
+    n_samples=10,
     grad_clip_norm=2,
     use_iwae=True,
 )
-iterations = enumerate(svi.iter_fit(train_data, test_data,  seed=SEED, num_workers=0, raise_bad=True))  # iterator
-
-train_losses = []
-val_losses = []
+iterations = enumerate(svi.iter_fit(train_data, test_data,  seed=SEED, num_workers=0,
+                                    raise_bad=True, return_kl_logl=True))  # iterator
 
 directory = Path('svi_model')
 space_dir = directory / 'plots'
@@ -172,8 +186,8 @@ params_dir.mkdir(parents=True, exist_ok=True)
 
 
 # make some test points to visualise the approximate posterior
-mean = np.array([[10.0, 0.0], [0.0, 0.0], [30, 3], [30, -3]])
-cov = np.array([
+mean = np.array([[10.0, 0.0], [2.0, 0.0], [5, 3], [5, -3]])  # in fitting space
+cov = np.array([  # in data space
     [
         [0.1, 0],
         [0, 3]
@@ -202,11 +216,18 @@ start_from = 0
 if start_from > 0:
     svi.model.load_state_dict(torch.load(params_dir / f'{start_from}.pt'))
 
+train_losses = []
+val_losses = []
+logls, kls = [], []
+
+
 def animate_and_save_to_disk(o):
-    i, (_svi, train_loss, val_loss) = o
+    i, (_svi, train_loss, val_loss, logl, kl) = o
     i += start_from
     train_losses.append(train_loss)
     val_losses.append(val_loss)
+    logls.append(logl)
+    kls.append(kl)
     torch.save(_svi.model.state_dict(), params_dir / f'{i}.pt')
     Yfitting = _svi.sample_prior(10000)
     Ydata = fitting2data(Yfitting)
@@ -236,33 +257,38 @@ def animate_and_save_to_disk(o):
             pnts = axs[0, 1].scatter(*qd.T.cpu().numpy(), s=1)
             plot_covariance(m, c, ax=axs[0, 1], color=pnts.get_facecolors()[0])
     axs[0, 1].set_title('approx post. - data space')
-    axs[1, 1].set_title('`approx post. - fitting space')
+    axs[1, 1].set_title('approx post. - fitting space')
 
-    axins.clear()
-    axins2.clear()
+    axins_losses.clear()
+    axins_losses2.clear()
+    axins_logl.clear()
     _train_losses = np.array(train_losses)[-20:]
     if len(val_losses):
         _val_losses = np.array(val_losses)[-20:]
     else:
         _val_losses = np.array([])
     if len(_train_losses):
-        axins.plot(_train_losses)
+        axins_losses.plot(_train_losses)
     if len(_val_losses):
-        axins2.plot(_val_losses)
+        axins_losses2.plot(_val_losses)
         try:
             mn, mx = min(_val_losses), max(_val_losses)
             buffer = (mx - mn) * 0.05
-            axins2.set_ylim([mn - buffer, mx + buffer])
+            axins_losses2.set_ylim([mn - buffer, mx + buffer])
         except (TypeError, ValueError):
             pass
         try:
             mn, mx = min(_train_losses), max(_train_losses)
             buffer = (mx - mn) * 0.05
-            axins.set_ylim([mn-buffer, mx+buffer])
+            axins_losses.set_ylim([mn - buffer, mx + buffer])
         except (TypeError, ValueError):
             pass
 
-    axins.set_xscale('log')
+    axins_logl.plot(np.array(logls)[-20:])
+    axins_logl.plot(np.array(kls)[-20:])
+
+    axins_losses.set_xscale('log')
+    axins_logl.set_xscale('log')
     fig.savefig(space_dir / f'{i}.png')
 
 
