@@ -29,7 +29,7 @@ class VariationalAutoencoder(nn.Module):
     def forward(self, *args):
         raise RuntimeError('Forward method cannot be called for a VAE object.')
 
-    def stochastic_elbo(self, inputs, num_samples=1, kl_multiplier=1, keepdim=False):
+    def stochastic_elbo(self, inputs, num_samples=1, kl_multiplier=1., keepdim=False):
         """Calculates an unbiased Monte-Carlo estimate of the evidence lower bound.
         Note: the KL term is also estimated via Monte Carlo.
         Args:
@@ -75,8 +75,8 @@ class VariationalAutoencoder(nn.Module):
             average[mask.any(axis=-1).any(axis=-1)] = torch.finfo().min / 100
             return average
 
-    def log_prob_lower_bound(self, inputs, num_samples=100):
-        elbo = self.stochastic_elbo(inputs, num_samples=num_samples, keepdim=True)
+    def log_prob_lower_bound(self, inputs, num_samples=100, kl_multiplier=1., separate=False):
+        elbo = self.stochastic_elbo(inputs, num_samples=num_samples, kl_multiplier=kl_multiplier, keepdim=True)
         log_prob_lower_bound = torch.logsumexp(elbo, dim=1) - torch.log(torch.tensor([num_samples], device=elbo.device))
         return log_prob_lower_bound
 

@@ -102,7 +102,7 @@ class SVIFlow(MAFlow):
 
     def is_bad_step(self, loss):
         bad_model = any(map(lambda x: torch.isnan(x).any().cpu().numpy(), self.model.parameters(recurse=True)))
-        return bad_model or not np.isfinite(loss)
+        return bad_model or not torch.isfinite(loss).cpu().numpy()
 
     def undo_step(self, epoch, checkpoint):
         print(f'Epoch {epoch}: model parameters got updated to NaN or resulting in invalid loss, rolling back and slowing down')
@@ -116,7 +116,6 @@ class SVIFlow(MAFlow):
         scheduler._last_lr = [group['lr'] for group in scheduler.optimizer.param_groups]
 
     def iter_fit(self, data, val_data=None, show_bar=True, seed=None, use_cuda=False, num_workers=4, raise_bad=False):
-
         optimiser = torch.optim.Adam(
             params=self.model.parameters(),
             lr=self.lr
@@ -148,6 +147,8 @@ class SVIFlow(MAFlow):
         )
         bar = tqdm(range(self.epochs), disable=not show_bar, unit='epochs', smoothing=1)
         train_loss = 0.0
+        val_loss = 0.0
+        kl_multiplier = 1.
         checkpoint = self.checkpoint_fitting(optimiser, scheduler)
 
         for iepoch in bar:
@@ -166,17 +167,20 @@ class SVIFlow(MAFlow):
                     if self.use_iwae:
                         objective = self.model.log_prob_lower_bound(
                             d,
-                            num_samples=self.n_samples
+                            num_samples=self.n_samples,
+                            kl_multiplier=kl_multiplier
                         )
                     else:
                         objective = self.model.stochastic_elbo(
                             d,
-                            num_samples=self.n_samples
+                            num_samples=self.n_samples,
+                            kl_multiplier=kl_multiplier
                         )
                     torch.set_default_tensor_type(torch.FloatTensor)
 
-                    train_loss += torch.sum(objective).item()
-                    loss = -1 * torch.mean(objective)
+                    minibatch_scaling = data.X.shape[0] / d[0].shape[0]
+                    train_loss += torch.sum(objective * minibatch_scaling).item()
+                    loss = -1 * torch.mean(objective * minibatch_scaling)
                     loss.backward()
                     if self.grad_clip_norm is not None:
                         torch.nn.utils.clip_grad_norm_(
