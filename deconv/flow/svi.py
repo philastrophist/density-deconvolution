@@ -91,7 +91,7 @@ class SVIFlow(MAFlow):
         return f
 
     def fit(self, data, val_data=None, show_bar=True, seed=None, raise_bad=False):
-        for i in self.iter_fit(data, val_data, show_bar, seed, raise_bad=raise_bad):
+        for i in self.iter_fit(data, val_data, show_bar, seed, rewind_on_inf=raise_bad):
             pass
 
     def checkpoint_fitting(self, optimiser, scheduler):
@@ -116,7 +116,7 @@ class SVIFlow(MAFlow):
         scheduler._last_lr = [group['lr'] for group in scheduler.optimizer.param_groups]
 
     def iter_fit(self, data, val_data=None, show_bar=True, seed=None, use_cuda=False, num_workers=4,
-                 raise_bad=False, return_kl_logl=False):
+                 rewind_on_inf=False, return_kl_logl=False):
         optimiser = torch.optim.Adam(
             params=self.model.parameters(),
             lr=self.lr
@@ -200,7 +200,7 @@ class SVIFlow(MAFlow):
                 kls /= len(data)
 
                 if self.is_bad_step(train_loss):
-                    if raise_bad:
+                    if not rewind_on_inf:
                         raise ValueError(f"Bad loss or network parameters")
                     self.undo_step(iepoch, checkpoint)
                     checkpoint = self.checkpoint_fitting(optimiser, scheduler)

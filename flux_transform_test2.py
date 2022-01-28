@@ -90,7 +90,7 @@ def uncertainty(x):
     return S
 
 
-S = uncertainty(Zdata) * 0.00001  # TODO: test when errors look realistic
+S = uncertainty(Zdata) * 1.  # TODO: test when errors look realistic
 noise = torch.distributions.MultivariateNormal(loc=torch.Tensor([0.0, 0.0]), covariance_matrix=S).sample((1,))[0]
 
 # noisy data in both spaces
@@ -166,14 +166,14 @@ svi = MySVIFlow(
     5,
     device= torch.device('cpu'),
     batch_size=2000,
-    epochs=500,
-    lr=1e-4,
+    epochs=2,
+    lr=8e-5,
     n_samples=10,
     grad_clip_norm=2,
     use_iwae=True,
 )
-iterations = enumerate(svi.iter_fit(train_data, test_data,  seed=SEED, num_workers=0,
-                                    raise_bad=True, return_kl_logl=True))  # iterator
+iterations = enumerate(svi.iter_fit(train_data, test_data, seed=SEED, num_workers=0,
+                                    rewind_on_inf=True, return_kl_logl=True))  # iterator
 
 directory = Path('svi_model')
 space_dir = directory / 'plots'
@@ -212,7 +212,7 @@ test_point = [
     vmap(torch.cholesky)(torch.Tensor(cov)).to(svi.device)
 ]
 
-start_from = 0
+start_from = 30
 if start_from > 0:
     svi.model.load_state_dict(torch.load(params_dir / f'{start_from}.pt'))
 
