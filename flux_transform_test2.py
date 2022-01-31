@@ -166,7 +166,7 @@ svi = MySVIFlow(
     5,
     device= torch.device('cpu'),
     batch_size=2000,
-    epochs=50,
+    epochs=2,
     lr=8e-5,
     n_samples=10,
     grad_clip_norm=2,
@@ -212,7 +212,7 @@ test_point = [
     vmap(torch.cholesky)(torch.Tensor(cov)).to(svi.device)
 ]
 
-start_from = 0
+start_from = 49
 if start_from > 0:
     svi.model.load_state_dict(torch.load(params_dir / f'{start_from}.pt'))
 

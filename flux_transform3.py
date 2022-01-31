@@ -68,7 +68,7 @@ Zdata = Zdata[idx]
 # the first dimension is flux and is transformed to asinh mag to get rid of huge orders of mag range, 2nd dim is left alone
 # this functions transform back and forth from data plane (where uncertainties will be gaussians) and the fitting plane
 # TODO test normalising data a little better
-scaling = 10_000
+scaling = 1
 
 
 def data2fitting(x):
@@ -79,7 +79,10 @@ def data2fitting(x):
 def fitting2data(x):
     x = x.T
     # return x.T
-    return torch.stack([torch.sinh(x[0]/scaling)*10, x[1]]).T
+    return torch.stack([torch.sinh(x[0] * 10.)/scaling, x[1]]).T
+
+test_val = torch.tensor([[100., 23.4]])
+np.testing.assert_allclose(test_val.cpu().numpy(), fitting2data(data2fitting(test_val)).cpu().numpy(), 1e-4)  # float32 is a bit crap
 
 Zfitting = data2fitting(Zdata)
 
@@ -130,7 +133,7 @@ class DeconvGaussianTransformed(Distribution):
 
     def temporary_use_jacobian(self, x):
         J = torch.zeros((x.shape[0], x.shape[1], x.shape[1]))
-        J[:, 0, 0] = torch.cosh(x[:, 0]/scaling) / scaling * 10
+        J[:, 0, 0] = torch.cosh(x[:, 0]*10) * 10 / scaling
         J[:, 1, 1] = 1.
         return J
 
@@ -145,12 +148,6 @@ class DeconvGaussianTransformed(Distribution):
 
 
 class MySVIFlow(SVIFlow):
-    def _create_prior(self):
-        return super()._create_prior()
-
-    def sample_prior(self, num_samples, device=torch.device('cpu')):
-        return super().sample_prior(num_samples, device)
-
     def _create_likelihood(self):
         return DeconvGaussianTransformed(fitting2data, data2fitting)
 
@@ -162,6 +159,7 @@ X_test = Xfitting[Xfitting.shape[0] // 2:]
 S_test = S[S.shape[0] // 2:]
 
 train_data = DeconvDataset(X_train, torch.cholesky(S_train))
+train_initial_data = DeconvDataset(X_train, torch.cholesky(S_train*0.00001))
 test_data = DeconvDataset(X_test, torch.cholesky(S_test))
 
 fig, axs = plt.subplots(2, 2, sharex='row', sharey='row')
@@ -174,19 +172,42 @@ axins_losses2.set_ylabel('val loss')
 axins_logl = inset_axes(axs[0, 1], width='40%', height='40%', loc='lower right')
 axins_logl.set_ylabel('train logl,kl terms')
 
+svi_initial = SVIFlow(
+    2,
+    2,
+    device= torch.device('cpu'),
+    batch_size=2000,
+    epochs=200,
+    lr=1e-4,
+    n_samples=10,
+    grad_clip_norm=2,
+    use_iwae=True,
+)
+
 svi = MySVIFlow(
     2,
     2,
     device= torch.device('cpu'),
     batch_size=2000,
-    epochs=20,
-    lr=1e-5,
+    epochs=200,
+    lr=1e-6,
     n_samples=10,
     grad_clip_norm=2,
     use_iwae=True,
 )
-iterations = enumerate(svi.iter_fit(train_data, test_data, seed=SEED, num_workers=0,
-                                    rewind_on_inf=True, return_kl_logl=True))  # iterator
+
+def iterator():
+    for i_initial in enumerate(svi_initial.iter_fit(train_initial_data, seed=SEED, num_workers=0,
+                                    rewind_on_inf=True, return_kl_logl=True)):  # iterator
+        yield i_initial
+    svi.model.load_state_dict(svi_initial.model.state_dict())  # transfer
+    for i in enumerate(svi.iter_fit(train_data, test_data, seed=SEED, num_workers=0,
+                                    rewind_on_inf=True, return_kl_logl=True)):  # iterator
+        i += i_initial[0]
+        yield i
+
+iterations = iterator()
+
 
 directory = Path('svi_model')
 space_dir = directory / 'plots'
@@ -302,14 +323,14 @@ def animate_and_save_to_disk(o, plot=True):
     axins_logl.plot(np.array(logls)[-20:])
     axins_logl.plot(np.array(kls)[-20:])
 
-    axins_losses.set_xscale('log')
-    axins_logl.set_xscale('log')
+    # axins_losses.set_xscale('log')
+    # axins_logl.set_xscale('log')
     fig.savefig(space_dir / f'{i}.png')
 
 
 # run and animate at the same time
-# ani = animation.FuncAnimation(fig, animate_and_save_to_disk, interval=500, frames=iterations, repeat=False)
+ani = animation.FuncAnimation(fig, animate_and_save_to_disk, interval=500, frames=iterations, repeat=False)
 # # run only animate after
-for i in iterations:
-    animate_and_save_to_disk(i)
+# for i in iterations:
+#     animate_and_save_to_disk(i)
 plt.show()

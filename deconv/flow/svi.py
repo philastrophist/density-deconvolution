@@ -308,7 +308,7 @@ class SVIFlow(MAFlow):
         log_w = utils.split_leading_dim(log_w, [-1, num_samples])
         log_w[torch.isnan(log_w)] = -torch.inf
         log_w -= torch.logsumexp(log_w, dim=-1)[:, None]
-        log_w[torch.isnan(log_w)] = -torch.inf
+        log_w[~torch.isfinite(log_w)] = torch.finfo().min
         
         samples = utils.split_leading_dim(samples, [-1, num_samples])
         idx = torch.distributions.Categorical(logits=log_w).sample([num_samples])
