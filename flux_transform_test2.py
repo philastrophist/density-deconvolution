@@ -166,7 +166,7 @@ svi = MySVIFlow(
     5,
     device= torch.device('cpu'),
     batch_size=2000,
-    epochs=2,
+    epochs=50,
     lr=8e-5,
     n_samples=10,
     grad_clip_norm=2,
@@ -212,7 +212,7 @@ test_point = [
     vmap(torch.cholesky)(torch.Tensor(cov)).to(svi.device)
 ]
 
-start_from = 30
+start_from = 0
 if start_from > 0:
     svi.model.load_state_dict(torch.load(params_dir / f'{start_from}.pt'))
 
@@ -293,9 +293,9 @@ def animate_and_save_to_disk(o):
 
 
 # run and animate at the same time
-ani = animation.FuncAnimation(fig, animate_and_save_to_disk, interval=500, frames=iterations, repeat=False)
+# ani = animation.FuncAnimation(fig, animate_and_save_to_disk, interval=500, frames=iterations, repeat=False)
 # # run only animate after
-# for i in iterations:
-#     pass
-# animate_and_save_to_disk(i)
+for i in iterations:
+    pass
+animate_and_save_to_disk(i)
 plt.show()

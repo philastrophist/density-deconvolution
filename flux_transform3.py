@@ -1,5 +1,5 @@
 from pathlib import Path
-
+import math
 import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
@@ -7,13 +7,14 @@ import torch
 from functorch import jacrev, vmap
 from matplotlib import animation
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+from nflows.utils import torchutils
 
 from deconv.gmm.data import DeconvDataset
 from deconv.flow.svi import SVIFlow
 from nflows.distributions import Distribution
 from torch.distributions import MultivariateNormal
 
-torch.autograd.set_detect_anomaly(True)
+# torch.autograd.set_detect_anomaly(True)
 
 def set_seed(seed):
     import random
@@ -67,15 +68,18 @@ Zdata = Zdata[idx]
 # the first dimension is flux and is transformed to asinh mag to get rid of huge orders of mag range, 2nd dim is left alone
 # this functions transform back and forth from data plane (where uncertainties will be gaussians) and the fitting plane
 # TODO test normalising data a little better
+scaling = 10_000
+
+
 def data2fitting(x):
     x = x.T
     # return x.T
-    return torch.stack([torch.asinh(x[0]), x[1]]).T
+    return torch.stack([torch.asinh(x[0]*scaling)/10, x[1]]).T
 
 def fitting2data(x):
     x = x.T
     # return x.T
-    return torch.stack([torch.sinh(x[0]), x[1]]).T
+    return torch.stack([torch.sinh(x[0]/scaling)*10, x[1]]).T
 
 Zfitting = data2fitting(Zdata)
 
@@ -112,7 +116,6 @@ axs[1].set_title('True fitting space')
 data_lims = (axs[0].get_xlim(), axs[0].get_ylim())
 fitting_lims = (axs[1].get_xlim(), axs[1].get_ylim())
 
-
 class DeconvGaussianTransformed(Distribution):
     """
     Same as the original but the uncertainty gaussians are uncorrelated.
@@ -127,7 +130,7 @@ class DeconvGaussianTransformed(Distribution):
 
     def temporary_use_jacobian(self, x):
         J = torch.zeros((x.shape[0], x.shape[1], x.shape[1]))
-        J[:, 0, 0] = torch.cosh(x[:, 0])
+        J[:, 0, 0] = torch.cosh(x[:, 0]/scaling) / scaling * 10
         J[:, 1, 1] = 1.
         return J
 
@@ -142,6 +145,12 @@ class DeconvGaussianTransformed(Distribution):
 
 
 class MySVIFlow(SVIFlow):
+    def _create_prior(self):
+        return super()._create_prior()
+
+    def sample_prior(self, num_samples, device=torch.device('cpu')):
+        return super().sample_prior(num_samples, device)
+
     def _create_likelihood(self):
         return DeconvGaussianTransformed(fitting2data, data2fitting)
 
@@ -167,17 +176,17 @@ axins_logl.set_ylabel('train logl,kl terms')
 
 svi = MySVIFlow(
     2,
-    5,
+    2,
     device= torch.device('cpu'),
     batch_size=2000,
-    epochs=50,
-    lr=1e-6,
+    epochs=20,
+    lr=1e-5,
     n_samples=10,
     grad_clip_norm=2,
     use_iwae=True,
 )
 iterations = enumerate(svi.iter_fit(train_data, test_data, seed=SEED, num_workers=0,
-                                    rewind_on_inf=False, return_kl_logl=True))  # iterator
+                                    rewind_on_inf=True, return_kl_logl=True))  # iterator
 
 directory = Path('svi_model')
 space_dir = directory / 'plots'
@@ -225,7 +234,7 @@ val_losses = []
 logls, kls = [], []
 
 
-def animate_and_save_to_disk(o):
+def animate_and_save_to_disk(o, plot=True):
     i, (_svi, train_loss, val_loss, logl, kl) = o
     i += start_from
     train_losses.append(train_loss)
@@ -233,6 +242,8 @@ def animate_and_save_to_disk(o):
     logls.append(logl)
     kls.append(kl)
     torch.save(_svi.model.state_dict(), params_dir / f'{i}.pt')
+    if not plot:
+        return
     Yfitting = _svi.sample_prior(10000)
     Ydata = fitting2data(Yfitting)
     try:
@@ -297,9 +308,8 @@ def animate_and_save_to_disk(o):
 
 
 # run and animate at the same time
-ani = animation.FuncAnimation(fig, animate_and_save_to_disk, interval=500, frames=iterations, repeat=False)
+# ani = animation.FuncAnimation(fig, animate_and_save_to_disk, interval=500, frames=iterations, repeat=False)
 # # run only animate after
-# for i in iterations:
-#     pass
-# animate_and_save_to_disk(i)
+for i in iterations:
+    animate_and_save_to_disk(i)
 plt.show()
