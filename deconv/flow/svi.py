@@ -184,6 +184,7 @@ class SVIFlow(MAFlow):
                     torch.set_default_tensor_type(torch.FloatTensor)
 
                     minibatch_scaling = data.X.shape[0] / d[0].shape[0]
+                    objective = torch.clamp(objective, -1e+30, 1e+30).sum()
                     train_loss += torch.sum(objective * minibatch_scaling).item()
                     logls += torch.sum(logl * minibatch_scaling).item()
                     kls += torch.sum(kl * minibatch_scaling).item()
@@ -195,7 +196,6 @@ class SVIFlow(MAFlow):
                             self.grad_clip_norm
                         )
                     optimiser.step()
-                train_loss /= len(data)
                 logls /= len(data)
                 kls /= len(data)
 
@@ -215,7 +215,7 @@ class SVIFlow(MAFlow):
                         num_samples=self.n_samples,
                         use_cuda=use_cuda,
                         num_workers=num_workers
-                    ) / len(val_data)
+                    ) * minibatch_scaling
                     bar.desc = f'loss[train|val], [logl|kl]: {train_loss:.4f} | {val_loss:.4f}, {logls:.4f} | {kls:.4f}'
                     scheduler.step(val_loss)
                 else:

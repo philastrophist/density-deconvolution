@@ -14,7 +14,7 @@ from deconv.flow.svi import SVIFlow
 from nflows.distributions import Distribution
 from torch.distributions import MultivariateNormal
 
-# torch.autograd.set_detect_anomaly(True)
+torch.autograd.set_detect_anomaly(True)
 
 def set_seed(seed):
     import random
@@ -29,7 +29,7 @@ def jacobianBatch(f, x):
   return vmap(jacrev(f))(x)
 
 
-sns.set()
+# sns.set()
 SEED = 1234
 set_seed(SEED)
 
@@ -46,11 +46,11 @@ covars = torch.Tensor([
         [0, 1.5]
     ],
     [
-        [1, 0],
+        [0.25, 0],
         [0, 0.1]
     ],
     [
-        [1, 0],
+        [0.25, 0],
         [0, 0.1]
     ]
 ])
@@ -58,6 +58,8 @@ N = 10_000
 
 # this is all in data space
 Zreal = torch.distributions.MultivariateNormal(loc=means, covariance_matrix=covars).sample((N-(N//5),)).reshape((-1, 2))
+# Zreal = torch.where(Zreal > torch.scalar_tensor(10_000, dype=real.dtype), torch.scalar_tensor(10_000, dype=Zreal.dtype), Zreal)
+Zreal = torch.clamp(Zreal, -10_000, 10_000)
 Zreal[:, 0] = 10**(Zreal[:, 0])  # make it into fluxes
 Zfake = torch.distributions.MultivariateNormal(loc=means[:1], covariance_matrix=covars[:1]).sample((N//5,)).reshape((-1, 2))
 Zdata = torch.concat([Zreal, Zfake], dim=0)
@@ -69,7 +71,7 @@ Zdata = Zdata[idx]
 # this functions transform back and forth from data plane (where uncertainties will be gaussians) and the fitting plane
 # TODO test normalising data a little better
 scaling = 1
-
+cap = 15
 
 def data2fitting(x):
     x = x.T
@@ -79,7 +81,11 @@ def data2fitting(x):
 def fitting2data(x):
     x = x.T
     # return x.T
-    return torch.stack([torch.sinh(x[0] * 10.)/scaling, x[1]]).T
+    return torch.stack([torch.sinh(torch.clamp(x[0] * 10, -cap, cap))/scaling, x[1]]).T
+
+def jac(x):
+    return torch.cosh(torch.clamp(x * 10., -cap, cap)) * 10 / scaling
+
 
 test_val = torch.tensor([[100., 23.4]])
 np.testing.assert_allclose(test_val.cpu().numpy(), fitting2data(data2fitting(test_val)).cpu().numpy(), 1e-4)  # float32 is a bit crap
@@ -133,7 +139,7 @@ class DeconvGaussianTransformed(Distribution):
 
     def temporary_use_jacobian(self, x):
         J = torch.zeros((x.shape[0], x.shape[1], x.shape[1]))
-        J[:, 0, 0] = torch.cosh(x[:, 0]*10) * 10 / scaling
+        J[:, 0, 0] = jac(x[:, 0])
         J[:, 1, 1] = 1.
         return J
 
@@ -144,6 +150,12 @@ class DeconvGaussianTransformed(Distribution):
         context_transformed = self.fitting2data(context)
         log_scaling = torch.slogdet(jac)[1]
         Z = self.fitting2data(X)
+        context_transformed = torch.where(torch.isfinite(context_transformed), context_transformed,
+                                          torch.scalar_tensor(torch.finfo(context_transformed.dtype).min,
+                                                              dtype=context_transformed.dtype))
+        log_scaling = torch.where(torch.isfinite(log_scaling), log_scaling,
+                                          torch.scalar_tensor(torch.finfo(log_scaling.dtype).min,
+                                                              dtype=log_scaling.dtype))
         return MultivariateNormal(loc=context_transformed, scale_tril=noise_l).log_prob(Z) + log_scaling
 
 
@@ -172,43 +184,6 @@ axins_losses2.set_ylabel('val loss')
 axins_logl = inset_axes(axs[0, 1], width='40%', height='40%', loc='lower right')
 axins_logl.set_ylabel('train logl,kl terms')
 
-svi_initial = SVIFlow(
-    2,
-    2,
-    device= torch.device('cpu'),
-    batch_size=2000,
-    epochs=200,
-    lr=1e-4,
-    n_samples=10,
-    grad_clip_norm=2,
-    use_iwae=True,
-)
-
-svi = MySVIFlow(
-    2,
-    2,
-    device= torch.device('cpu'),
-    batch_size=2000,
-    epochs=200,
-    lr=1e-6,
-    n_samples=10,
-    grad_clip_norm=2,
-    use_iwae=True,
-)
-
-def iterator():
-    for i_initial in enumerate(svi_initial.iter_fit(train_initial_data, seed=SEED, num_workers=0,
-                                    rewind_on_inf=True, return_kl_logl=True)):  # iterator
-        yield i_initial
-    svi.model.load_state_dict(svi_initial.model.state_dict())  # transfer
-    for i in enumerate(svi.iter_fit(train_data, test_data, seed=SEED, num_workers=0,
-                                    rewind_on_inf=True, return_kl_logl=True)):  # iterator
-        i += i_initial[0]
-        yield i
-
-iterations = iterator()
-
-
 directory = Path('svi_model')
 space_dir = directory / 'plots'
 loss_dir = directory / 'loss'
@@ -217,6 +192,57 @@ directory.mkdir(parents=True, exist_ok=True)
 space_dir.mkdir(parents=True, exist_ok=True)
 loss_dir.mkdir(parents=True, exist_ok=True)
 params_dir.mkdir(parents=True, exist_ok=True)
+
+total_epochs = 200
+initial_epochs = 0
+start_from = 0
+
+svi_initial = SVIFlow(
+    2,
+    5,
+    device= torch.device('cpu'),
+    batch_size=2000,
+    epochs=initial_epochs,
+    lr=1e-4,
+    n_samples=10,
+    grad_clip_norm=2,
+    use_iwae=True,
+)
+
+svi = MySVIFlow(
+    2,
+    5,
+    device= torch.device('cpu'),
+    batch_size=2000,
+    epochs=total_epochs - initial_epochs,
+    lr=1e-2,
+    n_samples=10,
+    # grad_clip_norm=2,
+    use_iwae=True,
+)
+
+
+if start_from > 0:
+    svi_initial.model.load_state_dict(torch.load(params_dir / f'{start_from}.pt'))
+    svi.model.load_state_dict(torch.load(params_dir / f'{start_from}.pt'))
+    if start_from >= svi_initial.epochs:
+        svi_initial.epochs = 0
+        svi.epochs -= start_from
+    else:
+        svi_initial.epochs -= start_from
+
+
+def iterator():
+    i_initial = [start_from]
+    for i_initial in enumerate(svi_initial.iter_fit(train_initial_data, seed=SEED, num_workers=0,
+                                    rewind_on_inf=True, return_kl_logl=True)):  # iterator
+        yield (i_initial[0] + start_from, i_initial[1])
+    svi.model.load_state_dict(svi_initial.model.state_dict())  # transfer
+    for i in enumerate(svi.iter_fit(train_data, test_data, seed=SEED, num_workers=0,
+                                    rewind_on_inf=True, return_kl_logl=True)):  # iterator
+        yield (i[0] + i_initial[0], i[1])
+
+iterations = iterator()
 
 
 # make some test points to visualise the approximate posterior
@@ -245,10 +271,6 @@ test_point = [
     torch.Tensor(mean).to(svi.device),
     vmap(torch.cholesky)(torch.Tensor(cov)).to(svi.device)
 ]
-
-start_from = 0
-if start_from > 0:
-    svi.model.load_state_dict(torch.load(params_dir / f'{start_from}.pt'))
 
 train_losses = []
 val_losses = []
