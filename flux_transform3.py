@@ -13,7 +13,6 @@ from deconv.gmm.data import DeconvDataset
 from deconv.flow.svi import SVIFlow
 from nflows.distributions import Distribution
 from torch.distributions import MultivariateNormal
-
 torch.autograd.set_detect_anomaly(True)
 
 def set_seed(seed):
@@ -29,7 +28,7 @@ def jacobianBatch(f, x):
   return vmap(jacrev(f))(x)
 
 
-# sns.set()
+sns.set()
 SEED = 1234
 set_seed(SEED)
 
@@ -193,9 +192,9 @@ space_dir.mkdir(parents=True, exist_ok=True)
 loss_dir.mkdir(parents=True, exist_ok=True)
 params_dir.mkdir(parents=True, exist_ok=True)
 
-total_epochs = 200
+total_epochs = 2000
 initial_epochs = 0
-start_from = 0
+start_from = 85
 
 svi_initial = SVIFlow(
     2,
@@ -203,7 +202,7 @@ svi_initial = SVIFlow(
     device= torch.device('cpu'),
     batch_size=2000,
     epochs=initial_epochs,
-    lr=1e-4,
+    lr=1e-6,
     n_samples=10,
     grad_clip_norm=2,
     use_iwae=True,
@@ -215,9 +214,9 @@ svi = MySVIFlow(
     device= torch.device('cpu'),
     batch_size=2000,
     epochs=total_epochs - initial_epochs,
-    lr=1e-2,
+    lr=1e-5,
     n_samples=10,
-    # grad_clip_norm=2,
+    grad_clip_norm=2,
     use_iwae=True,
 )
 
