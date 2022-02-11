@@ -1,6 +1,9 @@
 import logging
+import warnings
+from collections import namedtuple
 from functools import reduce
 from pathlib import Path
+from typing import Any
 
 import matplotlib.pylab as plt
 import numpy as np
@@ -13,10 +16,13 @@ from functorch import jacrev, vmap
 from matplotlib import animation
 from matplotlib.ticker import MaxNLocator, LogLocator, ScalarFormatter
 from nflows.distributions import Distribution
+from scipy import optimize
+from torch.autograd import Function
 from torch.distributions import MultivariateNormal
 
 from deconv.flow.svi import SVIFlow
 from deconv.gmm.data import DeconvDataset
+from differentiation import LocDifferentiableMultivariateNormal
 
 logging.getLogger('chainconsumer').setLevel(logging.CRITICAL)
 
@@ -69,24 +75,22 @@ def luminosity(flux, redshift, scale=1.):
 
 lum_scale=1e+21
 line_scale = 1.
-filt = (overlapped['redshift_err'].values / overlapped.redshift.values) < 0.001
-print(f"bad redshifts: {sum(~filt)}")
+redshift_filt = (overlapped['redshift_err'].values / overlapped.redshift.values) < 0.001
+redshift_filt &= overlapped.zwarning == 0
+print(f"bad redshifts: {sum(~redshift_filt)}")
 
+lines = 'h_alpha_flux h_beta_flux nii_6584_flux oiii_5007_flux'.split()
+line_filt = np.ones_like(redshift_filt, dtype=bool)
+for line in lines:
+    line_filt &= (np.abs(overlapped[line]) < 1e+4) & (overlapped[line+'_err'] > 0) & np.isfinite(overlapped[line+'_err'])
+print(f"outlier line fluxes: {sum(~line_filt)}")
+overlapped = overlapped[redshift_filt & line_filt]
+print(f"using {len(overlapped)} data points")
 # data dimensions to use:
 # L150
 # redshift
 # M*
 # ha, hb, nii, oiii
-
-cov = np.zeros([len(overlapped), 7, 7], dtype=np.float32)
-cov[:, 0, 0] = luminosity(overlapped[data_err_name].values, overlapped.redshift.values, lum_scale)
-cov[:, 1, 1] = overlapped['redshift_err'].values
-cov[:, 2, 2] = ((overlapped['lgm_tot_p84'] - overlapped['lgm_tot_p16']) / 2).values
-cov[:, 3, 3] = overlapped['h_alpha_flux_err'].values / line_scale
-cov[:, 4, 4] = overlapped['h_beta_flux_err'].values
-cov[:, 5, 5] = overlapped['nii_6584_flux_err'].values / line_scale
-cov[:, 6, 6] = overlapped['oiii_5007_flux_err'].values
-cov = torch.tensor(cov[filt])**2.
 Xdata = torch.tensor(np.stack([
     luminosity(overlapped[data_flux_name].values, overlapped.redshift.values, lum_scale),
     overlapped.redshift.values,
@@ -95,19 +99,22 @@ Xdata = torch.tensor(np.stack([
     overlapped.h_beta_flux.values,
     overlapped.nii_6584_flux.values / line_scale,
     overlapped.oiii_5007_flux.values,
-
-]).T[filt].astype(np.float32))
+]).T.astype(np.float32))
+cov = np.zeros([len(overlapped), 7, 7], dtype=np.float32)
+cov[:, 0, 0] = luminosity(overlapped[data_err_name].values, overlapped.redshift.values, lum_scale)
+cov[:, 1, 1] = overlapped['redshift_err'].values
+cov[:, 2, 2] = ((overlapped['lgm_tot_p84'] - overlapped['lgm_tot_p16']) / 2).values
+cov[:, 3, 3] = overlapped['h_alpha_flux_err'].values / line_scale
+cov[:, 4, 4] = overlapped['h_beta_flux_err'].values
+cov[:, 5, 5] = overlapped['nii_6584_flux_err'].values / line_scale
+cov[:, 6, 6] = overlapped['oiii_5007_flux_err'].values
+cov = torch.tensor(cov)**2.
 
 
 # TODO test normalising data a little better
 scaling = 100
-cap = 15
+cap = 20.
 
-redshift_bounds = torch.min(Xdata[:, 1]), torch.max(Xdata[:, 1])
-redshift_width = redshift_bounds[1] - redshift_bounds[0]
-# add buffer to avoid infs
-redshift_bounds = redshift_bounds[0] - redshift_width * 0.1, redshift_bounds[1] + redshift_width * 0.1
-redshift_width = redshift_bounds[1] - redshift_bounds[0]
 
 def inv_logit(x):
     y = torch.exp(x)
@@ -115,19 +122,80 @@ def inv_logit(x):
 
 np.testing.assert_allclose(inv_logit(torch.logit(torch.scalar_tensor(0.3425))).numpy(), 0.3425)
 
-def redshift_scaling(z):
-    return (z - redshift_bounds[0]) / redshift_width
+TransformPair = namedtuple('TransformPair', ['data2fitting', 'fitting2data', 'jacobian'])
 
-def inv_redshift_scaling(y):
-    return (y * redshift_width) + redshift_bounds[0]
+def make_hard_bounder(x, buffer=0.001):
+    """
+    Returns the transformation function pair which makes a logit bound on x based on the data spread
+    i.e. the model is bounded to the spread of the data plus a little bit of a buffer
+    """
+    bounds = torch.min(x), torch.max(x)
+    width = bounds[1] - bounds[0]
+    # add buffer to avoid infs
+    bounds = bounds[0] - width * buffer, bounds[1] + width * buffer
+    width = bounds[1] - bounds[0]
 
-redshift_shift = torch.mean(redshift_scaling(Xdata[:, 1]))
+    def rescale(y):
+        return (y - bounds[0]) / width
+
+    def inv_rescale(y):
+        return (y * width) + bounds[0]
+
+    def _data2fitting(y):
+        return torch.logit(rescale(y))
+
+    def _fitting2data(y):
+        return inv_rescale(inv_logit(y))
+
+    def _jacobian(y):
+        exp = torch.exp(y)
+        return width * exp / ((exp + 1)**2)
+
+    return TransformPair(_data2fitting, _fitting2data, _jacobian)
+
+# def generalised_sigmoid(x, lower=0., upper=1., zero_value=0.5, shift=0., loggrowth=0., logv=0., c=1.):
+#     growth = np.exp(loggrowth)
+#     v = np.exp(logv)
+#     a = lower
+#     k = ((upper - a) * (c ** (1/v))) + a
+#     q = (((k - a) / (zero_value - a))**v) - c
+#     exp = torch.exp(-growth * (x - shift)) * q
+#     return a + ((k - a) / (c + exp))**(1/v)
+#
+# def switch(x, lower, upper, lower_value, upper_value):
+#     grad = (upper_value - lower_value) / (upper - lower)
+#     inter = upper_value - (grad * upper)
+#     return torch.where(x >= upper, upper_value, torch.where(x <= lower, lower_value, inter + (grad * x)))
+#
+#
+# def fit_soft(lower, upper, lower_value, upper_value, npoints=1000):
+#     buffer = (upper - lower) * 0.5
+#     x = np.linspace(lower-buffer, upper+buffer, npoints)
+#     y = switch(torch.as_tensor(x), lower, upper, lower_value, upper_value).numpy()
+#     mid = (upper - lower) / 2.
+#     mid_value = (upper_value - lower_value) / 2.
+#     p0 = [0., 0., 1.]
+#     popt, _ = optimize.curve_fit(lambda xx, *p:
+#                                  generalised_sigmoid(torch.as_tensor(xx), lower, upper, mid_value, mid, *p).numpy(), x, y, p0)
+#     return popt
+#
+
+# def soft_boundary(x, lower, upper, lower_value, upper_value, boundary_width):
+#     l = torch.sigmoid(-(x-lower) / boundary_width)
+#     u = torch.sigmoid((x-upper) / boundary_width)
+#     centre = (1-l) * (1-u)
+#     grad = (upper_value - lower_value) / (upper - lower)
+#     inter = upper_value - (grad * upper)
+#     y = (grad * x) + inter
+#     return (lower_value * l) + (upper_value * u) + (centre * y)
+
+redshift_bounder = make_hard_bounder(Xdata[:, 1])
 
 def data2fitting(x):
     x = x.T
     return torch.stack([
         torch.asinh(x[0] * scaling),
-        torch.logit(redshift_scaling(x[1])),
+        redshift_bounder.data2fitting(x[1]),
         x[2] - 10.5,
         torch.asinh(x[3]),
         torch.asinh(x[4]),
@@ -140,25 +208,24 @@ def fitting2data(x):
     x = x.T
     return torch.stack([
         torch.sinh(x[0]) / scaling,
-        inv_redshift_scaling(inv_logit(x[1])),
+        redshift_bounder.fitting2data(torch.clamp(x[1], -10., 10.)),
         x[2] + 10.5,
-        torch.sinh(torch.clamp(x[3], -30, 30)),
-        torch.sinh(torch.clamp(x[4], -30, 30)),
-        torch.sinh(torch.clamp(x[5], -30, 30)),
-        torch.sinh(torch.clamp(x[6], -30, 30)),
+        torch.sinh(torch.clamp(x[3], -cap, cap)),
+        torch.sinh(torch.clamp(x[4], -cap, cap)),
+        torch.sinh(torch.clamp(x[5], -cap, cap)),
+        torch.sinh(torch.clamp(x[6], -cap, cap)),
     ]).T
 fitting2data.names = ['scaled_L150', 'z', 'logM', 'ha', 'hb', 'nii', 'oiii']
 
 def jacobian(x):
     J = torch.zeros((x.shape[0], x.shape[1], x.shape[1]))
-    J[:, 0, 0] = torch.cosh(x[:, 0]) / scaling
-    exp = torch.exp(x[:, 1])
-    J[:, 1, 1] = redshift_width * exp / ((exp + 1)**2)
+    J[:, 0, 0] = torch.cosh(torch.clamp(x[:, 0], -cap, cap)) / scaling
+    J[:, 1, 1] = redshift_bounder.jacobian(torch.clamp(x[:, 1], -10., 10.))
     J[:, 2, 2] = 1.
-    J[:, 3, 3] = torch.cosh(x[:, 3])
-    J[:, 4, 4] = torch.cosh(x[:, 4])
-    J[:, 5, 5] = torch.cosh(x[:, 5])
-    J[:, 6, 6] = torch.cosh(x[:, 6])
+    J[:, 3, 3] = torch.cosh(torch.clamp(x[:, 3], -cap, cap))
+    J[:, 4, 4] = torch.cosh(torch.clamp(x[:, 4], -cap, cap))
+    J[:, 5, 5] = torch.cosh(torch.clamp(x[:, 5], -cap, cap))
+    J[:, 6, 6] = torch.cosh(torch.clamp(x[:, 6], -cap, cap))
     return J
 
 def data2auxillary(x):
@@ -166,11 +233,11 @@ def data2auxillary(x):
     Adds other dimension that may be used for plotting/diagnostics etc
     Not used in the actual fit
     """
-    x = x.T.detach().numpy()
-    return np.stack([
-        np.log10(x[0]*lum_scale),
-        np.log10(x[-2]) - np.log10(x[-4]),
-        np.log10(x[-1]) - np.log10(x[-3])
+    x = x.T
+    return torch.stack([
+        torch.log10(x[0]*lum_scale),
+        torch.log10(x[-2]) - torch.log10(x[-4]),
+        torch.log10(x[-1]) - torch.log10(x[-3])
         ]).T
 data2auxillary.names = ['log(L150)', 'log(nii / Ha)', 'log(oiii / Hb)']
 
@@ -206,7 +273,7 @@ class DeconvGaussianTransformed(Distribution):
         log_scaling = torch.where(torch.isfinite(log_scaling), log_scaling,
                                           torch.scalar_tensor(torch.finfo(log_scaling.dtype).min,
                                                               dtype=log_scaling.dtype))
-        return MultivariateNormal(loc=context_dataspace, scale_tril=noise_l).log_prob(Z) + log_scaling
+        return LocDifferentiableMultivariateNormal(loc=context_dataspace, scale_tril=noise_l).log_prob(Z) + log_scaling
 
 
 class MySVIFlow(SVIFlow):
@@ -347,8 +414,8 @@ class MyChainConsumer(ChainConsumer):
 def plot_samples(x_data, x_fitting, x_aux, y_data, y_fitting, y_aux, c=None):
     if c is None:
         c = MyChainConsumer()
-    observed = torch.concat([x_data, x_fitting, torch.as_tensor(x_aux)], axis=1).numpy()
-    fit = torch.concat([y_data, y_fitting, torch.as_tensor(y_aux)], axis=1).numpy()
+    observed = torch.concat([x_data, x_fitting, x_aux], axis=1).numpy()
+    fit = torch.concat([y_data, y_fitting, y_aux], axis=1).numpy()
 
     for i in range(len(c.chains)):
         c.remove_chain()
@@ -366,7 +433,9 @@ def plot_samples(x_data, x_fitting, x_aux, y_data, y_fitting, y_aux, c=None):
                 name='fit',
                 kde=False)
     c.configure(usetex=False, smooth=0, cloud=True, shade_alpha=0.15)
-    c.plotter.plot()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        c.plotter.plot()
     return c
 
 S = cov
@@ -377,8 +446,8 @@ X_train = Xfitting[Xfitting.shape[0] // partition:]
 S_train = S[S.shape[0] // partition:]
 print(f"validation={len(X_test)}, training={len(X_train)} ({1 / partition:.2%})")
 
-train_data = DeconvDataset(X_train, torch.cholesky(S_train))
-test_data = DeconvDataset(X_test, torch.cholesky(S_test))
+train_data = DeconvDataset(X_train, torch.linalg.cholesky(S_train))
+test_data = DeconvDataset(X_test, torch.linalg.cholesky(S_test))
 
 directory = Path('svi_model')
 space_dir = directory / 'plots'
