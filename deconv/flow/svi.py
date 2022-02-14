@@ -24,6 +24,14 @@ def seed_worker(worker_id):
     random.seed(worker_seed)
 
 
+class HandleInfFlow(flows.Flow):
+    def _log_prob(self, inputs, context):
+        embedded_context = self._embedding_net(context)
+        noise, logabsdet = self._transform(inputs, context=embedded_context)
+        noise = torch.where(torch.isfinite(noise), noise, torch.scalar_tensor(-1e+10, dtype=noise.dtype))
+        log_prob = self._distribution.log_prob(noise, context=embedded_context) + logabsdet
+        return torch.where(torch.isfinite(log_prob), log_prob, torch.scalar_tensor(-1e+10, dtype=log_prob.dtype))
+
 
 class SVIFlow(MAFlow):
 
@@ -54,7 +62,7 @@ class SVIFlow(MAFlow):
     def _create_prior(self):
         self.transform = self._create_transform(context_features=None, hidden_features=self.hidden_features)
         distribution = StandardNormal((self.dimensions,))
-        return flows.Flow(
+        return HandleInfFlow(
             self.transform,
             distribution
         )
@@ -71,7 +79,7 @@ class SVIFlow(MAFlow):
 
         posterior_transform = self._create_transform(self.context_size, hidden_features=self.hidden_features)
 
-        return flows.Flow(
+        return HandleInfFlow(
             transforms.InverseTransform(
                 posterior_transform
             ),

@@ -74,7 +74,7 @@ def luminosity(flux, redshift, scale=1.):
 
 
 lum_scale=1e+21
-line_scale = 1.
+line_scale = 1000.
 redshift_filt = (overlapped['redshift_err'].values / overlapped.redshift.values) < 0.001
 redshift_filt &= overlapped.zwarning == 0
 print(f"bad redshifts: {sum(~redshift_filt)}")
@@ -96,18 +96,18 @@ Xdata = torch.tensor(np.stack([
     overlapped.redshift.values,
     overlapped.lgm_tot_p50.values,
     overlapped.h_alpha_flux.values / line_scale,
-    overlapped.h_beta_flux.values,
+    overlapped.h_beta_flux.values / line_scale,
     overlapped.nii_6584_flux.values / line_scale,
-    overlapped.oiii_5007_flux.values,
+    overlapped.oiii_5007_flux.values / line_scale,
 ]).T.astype(np.float32))
 cov = np.zeros([len(overlapped), 7, 7], dtype=np.float32)
 cov[:, 0, 0] = luminosity(overlapped[data_err_name].values, overlapped.redshift.values, lum_scale)
 cov[:, 1, 1] = overlapped['redshift_err'].values
 cov[:, 2, 2] = ((overlapped['lgm_tot_p84'] - overlapped['lgm_tot_p16']) / 2).values
 cov[:, 3, 3] = overlapped['h_alpha_flux_err'].values / line_scale
-cov[:, 4, 4] = overlapped['h_beta_flux_err'].values
+cov[:, 4, 4] = overlapped['h_beta_flux_err'].values / line_scale
 cov[:, 5, 5] = overlapped['nii_6584_flux_err'].values / line_scale
-cov[:, 6, 6] = overlapped['oiii_5007_flux_err'].values
+cov[:, 6, 6] = overlapped['oiii_5007_flux_err'].values / line_scale
 cov = torch.tensor(cov)**2.
 
 
@@ -124,7 +124,7 @@ np.testing.assert_allclose(inv_logit(torch.logit(torch.scalar_tensor(0.3425))).n
 
 TransformPair = namedtuple('TransformPair', ['data2fitting', 'fitting2data', 'jacobian'])
 
-def make_hard_bounder(x, buffer=0.001):
+def make_hard_bounder(x, base_transform=lambda x: x, buffer=0.001):
     """
     Returns the transformation function pair which makes a logit bound on x based on the data spread
     i.e. the model is bounded to the spread of the data plus a little bit of a buffer
@@ -136,9 +136,15 @@ def make_hard_bounder(x, buffer=0.001):
     width = bounds[1] - bounds[0]
 
     def rescale(y):
+        """
+        transform y to the [0, 1] region
+        """
         return (y - bounds[0]) / width
 
     def inv_rescale(y):
+        """
+        transform y back to its original boundaries
+        """
         return (y * width) + bounds[0]
 
     def _data2fitting(y):
@@ -152,6 +158,18 @@ def make_hard_bounder(x, buffer=0.001):
         return width * exp / ((exp + 1)**2)
 
     return TransformPair(_data2fitting, _fitting2data, _jacobian)
+
+def ztransform(x, transform, data):
+    p = transform(data)
+    return (transform(x) - p.mean()) / p.std()
+
+def inv_ztransform(x, transform, data):
+    p = transform(data)
+    return (x * p.std()) + p.mean()
+
+def jac_ztransform_multiplier(transform, data):
+    p = transform(data)
+    return p.std()
 
 # def generalised_sigmoid(x, lower=0., upper=1., zero_value=0.5, shift=0., loggrowth=0., logv=0., c=1.):
 #     growth = np.exp(loggrowth)
@@ -188,7 +206,6 @@ def make_hard_bounder(x, buffer=0.001):
 #     inter = upper_value - (grad * upper)
 #     y = (grad * x) + inter
 #     return (lower_value * l) + (upper_value * u) + (centre * y)
-
 redshift_bounder = make_hard_bounder(Xdata[:, 1])
 
 def data2fitting(x):
@@ -197,23 +214,23 @@ def data2fitting(x):
         torch.asinh(x[0] * scaling),
         redshift_bounder.data2fitting(x[1]),
         x[2] - 10.5,
-        torch.asinh(x[3]),
-        torch.asinh(x[4]),
-        torch.asinh(x[5]),
-        torch.asinh(x[6]),
+        ztransform(x[3], torch.asinh, Xdata[:, 3]),
+        ztransform(x[4], torch.asinh, Xdata[:, 4]),
+        ztransform(x[5], torch.asinh, Xdata[:, 5]),
+        ztransform(x[6], torch.asinh, Xdata[:, 6])
     ]).T
 data2fitting.names = ['asinh(scaled_L150)', 'logit(z)', 'logM-10.5', 'asinh(ha)', 'asinh(hb)', 'asinh(nii)', 'asinh(oiii)']
 
 def fitting2data(x):
     x = x.T
     return torch.stack([
-        torch.sinh(x[0]) / scaling,
+        torch.sinh(torch.clamp(x[0], -cap, cap)) / scaling,
         redshift_bounder.fitting2data(torch.clamp(x[1], -10., 10.)),
         x[2] + 10.5,
-        torch.sinh(torch.clamp(x[3], -cap, cap)),
-        torch.sinh(torch.clamp(x[4], -cap, cap)),
-        torch.sinh(torch.clamp(x[5], -cap, cap)),
-        torch.sinh(torch.clamp(x[6], -cap, cap)),
+        torch.sinh(torch.clamp(inv_ztransform(x[3], torch.asinh, Xdata[:, 3]), -cap, cap)),
+        torch.sinh(torch.clamp(inv_ztransform(x[4], torch.asinh, Xdata[:, 4]), -cap, cap)),
+        torch.sinh(torch.clamp(inv_ztransform(x[5], torch.asinh, Xdata[:, 5]), -cap, cap)),
+        torch.sinh(torch.clamp(inv_ztransform(x[6], torch.asinh, Xdata[:, 6]), -cap, cap)),
     ]).T
 fitting2data.names = ['scaled_L150', 'z', 'logM', 'ha', 'hb', 'nii', 'oiii']
 
@@ -222,10 +239,10 @@ def jacobian(x):
     J[:, 0, 0] = torch.cosh(torch.clamp(x[:, 0], -cap, cap)) / scaling
     J[:, 1, 1] = redshift_bounder.jacobian(torch.clamp(x[:, 1], -10., 10.))
     J[:, 2, 2] = 1.
-    J[:, 3, 3] = torch.cosh(torch.clamp(x[:, 3], -cap, cap))
-    J[:, 4, 4] = torch.cosh(torch.clamp(x[:, 4], -cap, cap))
-    J[:, 5, 5] = torch.cosh(torch.clamp(x[:, 5], -cap, cap))
-    J[:, 6, 6] = torch.cosh(torch.clamp(x[:, 6], -cap, cap))
+    J[:, 3, 3] = torch.cosh(torch.clamp(x[:, 3], -cap, cap)) * jac_ztransform_multiplier(torch.asinh, Xdata[:, 3])
+    J[:, 4, 4] = torch.cosh(torch.clamp(x[:, 4], -cap, cap)) * jac_ztransform_multiplier(torch.asinh, Xdata[:, 4])
+    J[:, 5, 5] = torch.cosh(torch.clamp(x[:, 5], -cap, cap)) * jac_ztransform_multiplier(torch.asinh, Xdata[:, 5])
+    J[:, 6, 6] = torch.cosh(torch.clamp(x[:, 6], -cap, cap)) * jac_ztransform_multiplier(torch.asinh, Xdata[:, 6])
     return J
 
 def data2auxillary(x):
@@ -236,7 +253,7 @@ def data2auxillary(x):
     x = x.T
     return torch.stack([
         torch.log10(x[0]*lum_scale),
-        torch.log10(x[-2]) - torch.log10(x[-4]),
+        torch.log10(x[-2]) - torch.log10(x[-4]),  # line_scale is not needed since it's a ratio
         torch.log10(x[-1]) - torch.log10(x[-3])
         ]).T
 data2auxillary.names = ['log(L150)', 'log(nii / Ha)', 'log(oiii / Hb)']
@@ -246,7 +263,7 @@ from chainconsumer import ChainConsumer
 
 
 Xfitting = data2fitting(Xdata)
-np.testing.assert_allclose(fitting2data(Xfitting), Xdata, 2e-6)
+# np.testing.assert_allclose(fitting2data(Xfitting), Xdata, 2e-6)
 
 class DeconvGaussianTransformed(Distribution):
     """
@@ -440,7 +457,7 @@ def plot_samples(x_data, x_fitting, x_aux, y_data, y_fitting, y_aux, c=None):
 
 S = cov
 partition = 10
-X_test = Xfitting[:Xfitting.shape[0] // partition]
+X_test = Xfitting[:Xfitting.shape[Xdata0] // partition]
 S_test = S[:S.shape[0] // partition]
 X_train = Xfitting[Xfitting.shape[0] // partition:]
 S_train = S[S.shape[0] // partition:]
@@ -460,7 +477,7 @@ params_dir.mkdir(parents=True, exist_ok=True)
 
 total_epochs = 10_000
 start_from = 0
-plot_every = 1
+plot_every = 10
 svi = MySVIFlow(
     Xdata.shape[1],
     flow_steps=5,
@@ -478,10 +495,9 @@ if start_from > 0:
     svi.epochs -= start_from
 
 def iterator():
-    for i in enumerate(svi.iter_fit(train_data, test_data, seed=SEED, num_workers=0,
+    for i in enumerate(svi.iter_fit(train_data, test_data, seed=SEED, num_workers=8,
                                     rewind_on_inf=True, return_kl_logl=True), start_from):  # iterator
-        if not i[0] % plot_every:
-            yield i
+        yield i
 
 
 iterations = iterator()
@@ -494,8 +510,8 @@ Yfitting = svi.sample_prior(10000)[0]
 Ydata = fitting2data(Yfitting)
 Yaux = data2auxillary(Ydata)
 Xaux = data2auxillary(Xdata)
-# c = plot_samples(Xdata, Xfitting, Xaux, Ydata, Yfitting, Yaux)
-# axins_losses = c.plotter.fig_data[0].add_axes([0.6, 0.6, 0.3, 0.3])
+c = plot_samples(Xdata, Xfitting, Xaux, Ydata, Yfitting, Yaux)
+axins_losses = c.plotter.fig_data[0].add_axes([0.6, 0.6, 0.3, 0.3])
 
 def autoscale_y(ax,margin=0.05):
     """This function rescales the y-axis based on the data that is visible given the current xlim of the axis.
@@ -536,6 +552,8 @@ def animate_and_save_to_disk(o):
     torch.save(_svi.model.state_dict(), params_dir / f'{i}.pt')
     Yfitting = _svi.sample_prior(10000)[0]
     Ydata = fitting2data(Yfitting)
+    if i % plot_every:
+        return
 
     for ax in c.plotter.fig_data[0].axes:
         ax.clear()
@@ -554,7 +572,7 @@ def animate_and_save_to_disk(o):
     fig = c.plotter.fig_data[0]
     fig.savefig(space_dir / f'{i}.png')
 
-# ani = animation.FuncAnimation(c.plotter.fig_data[0], animate_and_save_to_disk, interval=500, frames=iterations, repeat=False)
-# plt.show()
-for _ in iterations:
-    pass
+ani = animation.FuncAnimation(c.plotter.fig_data[0], animate_and_save_to_disk, interval=500, frames=iterations, repeat=False)
+plt.show()
+# for _ in iterations:
+#     pass
