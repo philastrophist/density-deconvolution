@@ -11,12 +11,14 @@ import pandas as pd
 import torch
 from astropy import units as u
 from astropy.cosmology import Planck18
+from chainconsumer.helpers import get_grid_bins, get_smoothed_bins
 from chainconsumer.plotter import Plotter
 from functorch import jacrev, vmap
 from matplotlib import animation
 from matplotlib.ticker import MaxNLocator, LogLocator, ScalarFormatter
 from nflows.distributions import Distribution
 from scipy import optimize
+from scipy.interpolate import interp1d
 from torch.autograd import Function
 from torch.distributions import MultivariateNormal
 
@@ -300,6 +302,78 @@ class MySVIFlow(SVIFlow):
 
 class MyPlotter(Plotter):
     fig_data = None
+    #
+    # def _plot_bars(self, ax, parameter, chain, flip=False, summary=False):  # pragma: no cover
+    #
+    #     # Get values from config
+    #     colour = chain.config["color"]
+    #     linestyle = chain.config["linestyle"]
+    #     bar_shade = chain.config["bar_shade"]
+    #     linewidth = chain.config["linewidth"]
+    #     bins = chain.config["bins"]
+    #     smooth = chain.config["smooth"]
+    #     kde = chain.config["kde"]
+    #     zorder = chain.config["zorder"]
+    #     title_size = self.parent.config["label_font_size"]
+    #     if isinstance(self.parent.config["logged"], (tuple, list)):
+    #         logged = parameter in self.parent.config["logged"]
+    #     else:
+    #         logged = bool(self.parent.config["logged"])
+    #     chain_row = chain.get_data(parameter)
+    #     weights = chain.weights
+    #     if smooth or kde:
+    #         xs, ys, _ = self.parent.analysis._get_smoothed_histogram(chain, parameter, pad=True)
+    #         if logged:
+    #             ys = np.log10(ys)
+    #         if flip:
+    #             ax.plot(ys, xs, color=colour, ls=linestyle, lw=linewidth, zorder=zorder)
+    #         else:
+    #             ax.plot(xs, ys, color=colour, ls=linestyle, lw=linewidth, zorder=zorder)
+    #     else:
+    #         if flip:
+    #             orientation = "horizontal"
+    #         else:
+    #             orientation = "vertical"
+    #         if chain.grid:
+    #             bins = get_grid_bins(chain_row)
+    #         else:
+    #             bins, smooth = get_smoothed_bins(smooth, bins, chain_row, weights)
+    #         hist, edges = np.histogram(chain_row, bins=bins, density=True, weights=weights)
+    #         if chain.power is not None:
+    #             hist = hist ** chain.power
+    #         edge_center = 0.5 * (edges[:-1] + edges[1:])
+    #         xs, ys = edge_center, hist
+    #         ax.hist(xs, weights=ys, bins=bins, histtype="step", color=colour, orientation=orientation,
+    #                 ls=linestyle, lw=linewidth, zorder=zorder, log=logged)
+    #         if logged:
+    #             ys = np.log10(ys)
+    #     interp_type = "linear" if smooth else "nearest"
+    #     interpolator = interp1d(xs, ys, kind=interp_type)
+    #
+    #     if bar_shade:
+    #         fit_values = self.parent.analysis.get_parameter_summary(chain, parameter)
+    #         if fit_values is not None:
+    #             lower = fit_values[0]
+    #             upper = fit_values[2]
+    #             if lower is not None and upper is not None:
+    #                 if lower < xs.min():
+    #                     lower = xs.min()
+    #                 if upper > xs.max():
+    #                     upper = xs.max()
+    #                 x = np.linspace(lower, upper, 1000)
+    #                 ylim = ax.get_ylim()
+    #                 if flip:
+    #                     ax.fill_betweenx(x, np.ones(x.shape)*ylim[0], interpolator(x), color=colour, alpha=0.2, zorder=zorder)
+    #                 else:
+    #                     ax.fill_between(x, np.ones(x.shape)*ylim[0], interpolator(x), color=colour, alpha=0.2, zorder=zorder)
+    #                 ax.set_ylim(ylim)
+    #                 if summary:
+    #                     t = self.parent.analysis.get_parameter_text(*fit_values)
+    #                     if isinstance(parameter, str):
+    #                         ax.set_title(r"$%s = %s$" % (parameter.strip("$"), t), fontsize=title_size)
+    #                     else:
+    #                         ax.set_title(r"$%s$" % t, fontsize=title_size)
+    #     return ys.max()
 
     def _get_figure(self, all_parameters, flip, figsize=(5, 5), external_extents=None, chains=None, blind=None, log_scales=None):
         n = len(all_parameters)
@@ -427,16 +501,26 @@ class MyChainConsumer(ChainConsumer):
         super().__init__()
         self.plotter = MyPlotter(self)
 
+    def configure(self, statistics="max", max_ticks=5, plot_hists=True, flip=True, serif=True, sigma2d=False, sigmas=None, summary=None, bins=None, cmap=None, colors=None, linestyles=None, linewidths=None, kde=False, smooth=None, cloud=None, shade=None, shade_alpha=None, shade_gradient=None,
+                  bar_shade=None, num_cloud=None, color_params=None, plot_color_params=False, cmaps=None, plot_contour=None, plot_point=None, show_as_1d_prior=None, global_point=True, marker_style=None, marker_size=None, marker_alpha=None, usetex=True, diagonal_tick_labels=True, label_font_size=12,
+                  tick_font_size=10, spacing=None, contour_labels=None, contour_label_font_size=10, legend_kwargs=None, legend_location=None, legend_artists=None, legend_color_text=True, watermark_text_kwargs=None, summary_area=0.6827, zorder=None, stack=False,
+                  logged=False):
+        super().configure(statistics, max_ticks, plot_hists, flip, serif, sigma2d, sigmas, summary, bins, cmap, colors, linestyles, linewidths, kde, smooth, cloud, shade, shade_alpha, shade_gradient, bar_shade, num_cloud, color_params, plot_color_params, cmaps, plot_contour, plot_point,
+                                 show_as_1d_prior, global_point, marker_style, marker_size, marker_alpha, usetex, diagonal_tick_labels, label_font_size, tick_font_size, spacing, contour_labels, contour_label_font_size, legend_kwargs, legend_location, legend_artists, legend_color_text,
+                                 watermark_text_kwargs, summary_area, zorder, stack)
+        self.config["logged"] = logged
 
-def plot_samples(x_data, x_fitting, x_aux, y_data, y_fitting, y_aux, c=None):
+
+
+def plot_samples(x_data, x_fitting, x_aux, y_data, y_fitting, y_aux, record_df=None, c=None,
+                 parameters=None, log_scales=None, perc=(0.0001, 99.), log_densities=False):
     if c is None:
         c = MyChainConsumer()
-    observed = torch.concat([x_data, x_fitting, x_aux], axis=1).numpy()
-    fit = torch.concat([y_data, y_fitting, y_aux], axis=1).numpy()
+    observed = torch.concat([torch.as_tensor(x_data), torch.as_tensor(x_fitting), torch.as_tensor(x_aux)], axis=1).numpy()
+    fit = torch.concat([torch.as_tensor(y_data), torch.as_tensor(y_fitting), torch.as_tensor(y_aux)], axis=1).numpy()
 
     for i in range(len(c.chains)):
         c.remove_chain()
-    perc = [0.0001, 99.]
     extents = [(np.nanpercentile(x[np.isfinite(x)], perc), np.nanpercentile(y[np.isfinite(y)], perc)) for x, y in zip(observed.T, fit.T)]
     extents = [(min([x[0], y[0]]), max([x[1], y[1]])) for x, y in extents]
     filt = reduce(lambda a, b: a & b, ((o > l) & (o < u) for o, (l, u) in zip(observed.T, extents)))
@@ -449,15 +533,26 @@ def plot_samples(x_data, x_fitting, x_aux, y_data, y_fitting, y_aux, c=None):
                 parameters=fitting2data.names+data2fitting.names+data2auxillary.names,
                 name='fit',
                 kde=False)
-    c.configure(usetex=False, smooth=0, cloud=True, shade_alpha=0.15)
+    c.configure(usetex=False, smooth=0, cloud=True, shade_alpha=0.15, logged=log_densities)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
-        c.plotter.plot()
+        c.plotter.plot(parameters=parameters, log_scales=log_scales)
+    c.axins_losses = c.plotter.fig_data[0].add_axes([0.6, 0.6, 0.3, 0.3])
+    if record_df is not None:
+        c.axins_losses.clear()
+        if len(train_losses):
+            c.axins_losses.plot(range(len(record_df)), record_df['train'], label='train')
+        if len(val_losses):
+            c.axins_losses.plot(range(len(record_df)), record_df['val'], label='val')
+        c.axins_losses.set_xlim(max([0, max(epochs) - 20]), max(epochs))
+        autoscale_y(c.axins_losses)
+        c.axins_losses.legend(loc='lower right')
+        plt.suptitle(f'epoch {len(record_df)}')
     return c
 
 S = cov
 partition = 10
-X_test = Xfitting[:Xfitting.shape[Xdata0] // partition]
+X_test = Xfitting[:Xfitting.shape[0] // partition]
 S_test = S[:S.shape[0] // partition]
 X_train = Xfitting[Xfitting.shape[0] // partition:]
 S_train = S[S.shape[0] // partition:]
@@ -492,7 +587,10 @@ svi = MySVIFlow(
 
 if start_from > 0:
     svi.model.load_state_dict(torch.load(params_dir / f'{start_from}.pt'))
+    df = pd.read_csv(params_dir / f'record.csv').iloc[:start_from]
     svi.epochs -= start_from
+else:
+    df = pd.DataFrame({'train': [], 'val': [], 'logl': [], 'kl': []})
 
 def iterator():
     for i in enumerate(svi.iter_fit(train_data, test_data, seed=SEED, num_workers=8,
@@ -510,8 +608,7 @@ Yfitting = svi.sample_prior(10000)[0]
 Ydata = fitting2data(Yfitting)
 Yaux = data2auxillary(Ydata)
 Xaux = data2auxillary(Xdata)
-c = plot_samples(Xdata, Xfitting, Xaux, Ydata, Yfitting, Yaux)
-axins_losses = c.plotter.fig_data[0].add_axes([0.6, 0.6, 0.3, 0.3])
+
 
 def autoscale_y(ax,margin=0.05):
     """This function rescales the y-axis based on the data that is visible given the current xlim of the axis.
@@ -542,37 +639,33 @@ def autoscale_y(ax,margin=0.05):
 
     ax.set_ylim(bot,top)
 
-def animate_and_save_to_disk(o):
-    i, (_svi, train_loss, val_loss, logl, kl) = o
+def save_epoch_to_disk(i, _svi, train_loss, val_loss, logl, kl):
     epochs.append(i)
     train_losses.append(train_loss)
     val_losses.append(val_loss)
     logls.append(logl)
     kls.append(kl)
     torch.save(_svi.model.state_dict(), params_dir / f'{i}.pt')
-    Yfitting = _svi.sample_prior(10000)[0]
-    Ydata = fitting2data(Yfitting)
-    if i % plot_every:
-        return
+    df.iloc[i] = {'train': train_loss, 'val': val_loss, 'logl': logl, 'kl': kl}
+    df.to_csv(params_dir / f'record.csv')
 
-    for ax in c.plotter.fig_data[0].axes:
-        ax.clear()
+def plot_epoch(i, _svi, record_df=None, chainconsumer=None, parameters=None,
+               log_scales=None, perc=(0.0001, 99.), log_densities=False):
+    Yfitting = _svi.sample_prior(len(Xdata))[0]
+    Ydata = fitting2data(Yfitting)
+    if chainconsumer is not None:
+        for ax in chainconsumer.plotter.fig_data[0].axes:
+            ax.clear()
     Yaux = data2auxillary(Ydata)
     Xaux = data2auxillary(Xdata)
-    plot_samples(Xdata, Xfitting, Xaux, Ydata, Yfitting, Yaux, c)
-    axins_losses.clear()
-    if len(train_losses):
-        axins_losses.plot(epochs, train_losses, label='train')
-    if len(val_losses):
-        axins_losses.plot(epochs, val_losses, label='val')
-    axins_losses.set_xlim(max([0, max(epochs) - 20]), max(epochs))
-    autoscale_y(axins_losses)
-    axins_losses.legend(loc='lower right')
+    chainconsumer = plot_samples(Xdata, Xfitting, Xaux, Ydata, Yfitting, Yaux, record_df, chainconsumer,
+                                 parameters, log_scales, perc, log_densities)
+    fig = chainconsumer.plotter.fig_data[0]
     plt.suptitle(f'epoch {i}')
-    fig = c.plotter.fig_data[0]
-    fig.savefig(space_dir / f'{i}.png')
+    return fig
 
-ani = animation.FuncAnimation(c.plotter.fig_data[0], animate_and_save_to_disk, interval=500, frames=iterations, repeat=False)
-plt.show()
-# for _ in iterations:
-#     pass
+# ani = animation.FuncAnimation(c.plotter.fig_data[0], animate_and_save_to_disk, interval=500, frames=iterations, repeat=False)
+# plt.show()
+if __name__ == '__main__':
+    for o in iterations:
+        save_epoch_to_disk(*o)

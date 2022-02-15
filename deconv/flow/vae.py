@@ -5,6 +5,8 @@ Copied from the original NSF repo.
 """
 
 import torch
+from nflows.distributions import Distribution
+from nflows.flows import Flow
 
 from torch import nn
 
@@ -13,7 +15,8 @@ from nflows import utils
 class VariationalAutoencoder(nn.Module):
     """Implementation of a standard VAE."""
 
-    def __init__(self, prior, approximate_posterior, likelihood, inputs_encoder=None):
+    def __init__(self, prior: Flow, approximate_posterior: Flow, likelihood: Distribution,
+                 inputs_encoder: nn.Module = None):
         """
         Args:
             prior: a distribution object, the prior.
