@@ -8,7 +8,7 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 from fit_data_flux_mass import *
 
-i = 2600
+i = 9990
 svi.model.load_state_dict(torch.load(params_dir / f'{i}.pt'))
 try:
     df = pd.read_csv(params_dir / f'record.csv').iloc[:start_from]
@@ -71,98 +71,98 @@ from astroML.datasets.tools.sdss_fits import log_OIII_Hb_NII
 # plt.ylim(16, 22)
 
 # density plot
-# plot_samples(Xdata, Xfitting, Xaux, Ydata, Yfitting, Yaux)
+plot_samples(Xdata, Xfitting, Xaux, Ydata, Yfitting, Yaux)
 
 # logp plot of P(trueX | dataX, model)
 # svi.model._approximate_posterior.log_prob()
 
-# logL, logM colour coded by fraction of AGN/SFG
-from astroML.datasets.tools.sdss_fits import log_OIII_Hb_NII
-
-Y = np.where(np.isfinite(Y), Y, np.nan)  # make sure all invalid values are nan for classification
-agn = Y[:, names.index('log(oiii / Hb)')] > log_OIII_Hb_NII(Y[:, names.index('log(nii / Ha)')])
-sfg = Y[:, names.index('log(oiii / Hb)')] < log_OIII_Hb_NII(Y[:, names.index('log(nii / Ha)')])
-neither = ~agn & ~sfg
-
-
-fig, axs = plt.subplots(3, 1, sharex=True, sharey=True)
-
-c = axs[0].hexbin(Y[:, names.index('logM')], Y[:, names.index('log(L150)')], C=sfg,
-           gridsize=50, mincnt=10, cmap='viridis',
-           reduce_C_function=np.mean, extent=[9, 12, 16, 21])
-divider = make_axes_locatable(axs[0])
-cax = divider.append_axes('right', size='5%', pad=0.05)
-fig.colorbar(c, cax=cax, orientation='vertical').set_label('Fraction of SFG-unidentified')
-
-
-c = axs[1].hexbin(Y[:, names.index('logM')], Y[:, names.index('log(L150)')], C=agn,
-           gridsize=50, mincnt=10, cmap='inferno',
-           reduce_C_function=np.mean, extent=[9, 12, 16, 21])
-divider = make_axes_locatable(axs[1])
-cax = divider.append_axes('right', size='5%', pad=0.05)
-fig.colorbar(c, cax=cax, orientation='vertical').set_label('Fraction of BPT-AGN')
-
-c = axs[2].hexbin(Y[:, names.index('logM')], Y[:, names.index('log(L150)')], C=neither,
-           gridsize=50, mincnt=10, cmap='magma',
-           reduce_C_function=np.mean, extent=[9, 12, 16, 21], vmin=0.0088, vmax=0.4)
-divider = make_axes_locatable(axs[2])
-cax = divider.append_axes('right', size='5%', pad=0.05)
-fig.colorbar(c, cax=cax, orientation='vertical').set_label('Fraction of BPT-unidentified')
-
-axs[2].set_xlabel('logM')
-axs[1].set_ylabel('logL')
-
-
-
-fig, axs = plt.subplots(3, 1, sharex=True, sharey=True)
-
-c = axs[0].hexbin(Y[:, names.index('logM')], np.log10(Y[:, names.index('ha')]), C=sfg,
-           gridsize=100, mincnt=50, cmap='viridis',
-           reduce_C_function=np.mean, extent=[8, 12, -5, 5])
-divider = make_axes_locatable(axs[0])
-cax = divider.append_axes('right', size='5%', pad=0.05)
-fig.colorbar(c, cax=cax, orientation='vertical').set_label('Fraction of SFG-unidentified')
-
-
-c = axs[1].hexbin(Y[:, names.index('logM')], np.log10(Y[:, names.index('ha')]), C=agn,
-           gridsize=100, mincnt=50, cmap='inferno',
-           reduce_C_function=np.mean, extent=[8, 12, -5, 5])
-divider = make_axes_locatable(axs[1])
-cax = divider.append_axes('right', size='5%', pad=0.05)
-fig.colorbar(c, cax=cax, orientation='vertical').set_label('Fraction of BPT-AGN')
-
-c = axs[2].hexbin(Y[:, names.index('logM')], np.log10(Y[:, names.index('ha')]), C=neither,
-           gridsize=100, mincnt=50, cmap='magma',
-           reduce_C_function=np.mean, extent=[8, 12, -5, 5])
-divider = make_axes_locatable(axs[2])
-cax = divider.append_axes('right', size='5%', pad=0.05)
-fig.colorbar(c, cax=cax, orientation='vertical').set_label('Fraction of BPT-unidentified')
-
-axs[2].set_ylabel('logha')
-axs[1].set_xlabel('logM')
-
-
-fig, axs = plt.subplots(3, 1, sharex=True, sharey=True)
-c = axs[0].hexbin(Y[sfg, names.index('logM')], Y[sfg, names.index('log(L150)')], C=Y[sfg, names.index('ha')],
-           gridsize=100, mincnt=50, cmap='magma',
-           reduce_C_function=np.mean,  extent=[9, 12, 16, 21], )#vmin=-2.5, vmax=0.)
-divider = make_axes_locatable(axs[0])
-cax = divider.append_axes('right', size='5%', pad=0.05)
-fig.colorbar(c, cax=cax, orientation='vertical').set_label('Ha')
-
-c = axs[1].hexbin(Y[agn, names.index('logM')], Y[agn, names.index('log(L150)')], C=Y[agn, names.index('ha')],
-           gridsize=100, mincnt=50, cmap='magma',
-           reduce_C_function=np.mean,  extent=[9, 12, 16, 21], )#vmin=-2.5, vmax=0.)
-divider = make_axes_locatable(axs[1])
-cax = divider.append_axes('right', size='5%', pad=0.05)
-fig.colorbar(c, cax=cax, orientation='vertical').set_label('Ha')
-
-c = axs[2].hexbin(Y[neither, names.index('logM')], Y[neither, names.index('log(L150)')], C=Y[neither, names.index('ha')],
-           gridsize=100, mincnt=50, cmap='magma',
-           reduce_C_function=np.mean,  extent=[9, 12, 16, 21], )#vmin=-2.5, vmax=0.)
-divider = make_axes_locatable(axs[2])
-cax = divider.append_axes('right', size='5%', pad=0.05)
-fig.colorbar(c, cax=cax, orientation='vertical').set_label('Ha')
+# # logL, logM colour coded by fraction of AGN/SFG
+# from astroML.datasets.tools.sdss_fits import log_OIII_Hb_NII
+#
+# Y = np.where(np.isfinite(Y), Y, np.nan)  # make sure all invalid values are nan for classification
+# agn = Y[:, names.index('log(oiii / Hb)')] > log_OIII_Hb_NII(Y[:, names.index('log(nii / Ha)')])
+# sfg = Y[:, names.index('log(oiii / Hb)')] < log_OIII_Hb_NII(Y[:, names.index('log(nii / Ha)')])
+# neither = ~agn & ~sfg
+#
+#
+# fig, axs = plt.subplots(3, 1, sharex=True, sharey=True)
+#
+# c = axs[0].hexbin(Y[:, names.index('logM')], Y[:, names.index('log(L150)')], C=sfg,
+#            gridsize=50, mincnt=10, cmap='viridis',
+#            reduce_C_function=np.mean, extent=[9, 12, 16, 21])
+# divider = make_axes_locatable(axs[0])
+# cax = divider.append_axes('right', size='5%', pad=0.05)
+# fig.colorbar(c, cax=cax, orientation='vertical').set_label('Fraction of SFG-unidentified')
+#
+#
+# c = axs[1].hexbin(Y[:, names.index('logM')], Y[:, names.index('log(L150)')], C=agn,
+#            gridsize=50, mincnt=10, cmap='inferno',
+#            reduce_C_function=np.mean, extent=[9, 12, 16, 21])
+# divider = make_axes_locatable(axs[1])
+# cax = divider.append_axes('right', size='5%', pad=0.05)
+# fig.colorbar(c, cax=cax, orientation='vertical').set_label('Fraction of BPT-AGN')
+#
+# c = axs[2].hexbin(Y[:, names.index('logM')], Y[:, names.index('log(L150)')], C=neither,
+#            gridsize=50, mincnt=10, cmap='magma',
+#            reduce_C_function=np.mean, extent=[9, 12, 16, 21], vmin=0.0088, vmax=0.4)
+# divider = make_axes_locatable(axs[2])
+# cax = divider.append_axes('right', size='5%', pad=0.05)
+# fig.colorbar(c, cax=cax, orientation='vertical').set_label('Fraction of BPT-unidentified')
+#
+# axs[2].set_xlabel('logM')
+# axs[1].set_ylabel('logL')
+#
+#
+#
+# fig, axs = plt.subplots(3, 1, sharex=True, sharey=True)
+#
+# c = axs[0].hexbin(Y[:, names.index('logM')], np.log10(Y[:, names.index('ha')]), C=sfg,
+#            gridsize=100, mincnt=50, cmap='viridis',
+#            reduce_C_function=np.mean, extent=[8, 12, -5, 5])
+# divider = make_axes_locatable(axs[0])
+# cax = divider.append_axes('right', size='5%', pad=0.05)
+# fig.colorbar(c, cax=cax, orientation='vertical').set_label('Fraction of SFG-unidentified')
+#
+#
+# c = axs[1].hexbin(Y[:, names.index('logM')], np.log10(Y[:, names.index('ha')]), C=agn,
+#            gridsize=100, mincnt=50, cmap='inferno',
+#            reduce_C_function=np.mean, extent=[8, 12, -5, 5])
+# divider = make_axes_locatable(axs[1])
+# cax = divider.append_axes('right', size='5%', pad=0.05)
+# fig.colorbar(c, cax=cax, orientation='vertical').set_label('Fraction of BPT-AGN')
+#
+# c = axs[2].hexbin(Y[:, names.index('logM')], np.log10(Y[:, names.index('ha')]), C=neither,
+#            gridsize=100, mincnt=50, cmap='magma',
+#            reduce_C_function=np.mean, extent=[8, 12, -5, 5])
+# divider = make_axes_locatable(axs[2])
+# cax = divider.append_axes('right', size='5%', pad=0.05)
+# fig.colorbar(c, cax=cax, orientation='vertical').set_label('Fraction of BPT-unidentified')
+#
+# axs[2].set_ylabel('logha')
+# axs[1].set_xlabel('logM')
+#
+#
+# fig, axs = plt.subplots(3, 1, sharex=True, sharey=True)
+# c = axs[0].hexbin(Y[sfg, names.index('logM')], Y[sfg, names.index('log(L150)')], C=Y[sfg, names.index('ha')],
+#            gridsize=100, mincnt=50, cmap='magma',
+#            reduce_C_function=np.mean,  extent=[9, 12, 16, 21], )#vmin=-2.5, vmax=0.)
+# divider = make_axes_locatable(axs[0])
+# cax = divider.append_axes('right', size='5%', pad=0.05)
+# fig.colorbar(c, cax=cax, orientation='vertical').set_label('Ha')
+#
+# c = axs[1].hexbin(Y[agn, names.index('logM')], Y[agn, names.index('log(L150)')], C=Y[agn, names.index('ha')],
+#            gridsize=100, mincnt=50, cmap='magma',
+#            reduce_C_function=np.mean,  extent=[9, 12, 16, 21], )#vmin=-2.5, vmax=0.)
+# divider = make_axes_locatable(axs[1])
+# cax = divider.append_axes('right', size='5%', pad=0.05)
+# fig.colorbar(c, cax=cax, orientation='vertical').set_label('Ha')
+#
+# c = axs[2].hexbin(Y[neither, names.index('logM')], Y[neither, names.index('log(L150)')], C=Y[neither, names.index('ha')],
+#            gridsize=100, mincnt=50, cmap='magma',
+#            reduce_C_function=np.mean,  extent=[9, 12, 16, 21], )#vmin=-2.5, vmax=0.)
+# divider = make_axes_locatable(axs[2])
+# cax = divider.append_axes('right', size='5%', pad=0.05)
+# fig.colorbar(c, cax=cax, orientation='vertical').set_label('Ha')
 
 # pd.DataFrame(Y, columns=names).to_csv('svi_model_.csv')
 

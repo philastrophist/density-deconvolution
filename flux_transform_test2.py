@@ -165,10 +165,10 @@ svi = MySVIFlow(
     2,
     5,
     device= torch.device('cpu'),
-    batch_size=2000,
+    batch_size=500,
     epochs=200,
-    lr=1e-4,
-    n_samples=10,
+    lr=1e-6,
+    n_samples=50,
     grad_clip_norm=2,
     use_iwae=True,
 )
@@ -228,7 +228,7 @@ def animate_and_save_to_disk(o):
     val_losses.append(val_loss)
     logls.append(logl)
     kls.append(kl)
-    torch.save(_svi.model.state_dict(), params_dir / f'{i}.pt')
+    # torch.save(_svi.model.state_dict(), params_dir / f'{i}.pt')
     Yfitting = _svi.sample_prior(10000)
     Ydata = fitting2data(Yfitting)
     try:
@@ -289,7 +289,7 @@ def animate_and_save_to_disk(o):
 
     axins_losses.set_xscale('log')
     axins_logl.set_xscale('log')
-    fig.savefig(space_dir / f'{i}.png')
+    # fig.savefig(space_dir / f'{i}.png')
 
 
 # run and animate at the same time
