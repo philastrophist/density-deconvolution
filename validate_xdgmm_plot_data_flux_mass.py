@@ -164,7 +164,7 @@ test_points = [
 ]
 
 plotter = Plotter()
-i = 20
+i = None
 plotter.plot_epoch(i)
 plotter.c.add_chain(xdgmm.sample(10_000), data2fitting.names, 'xdgmm')
 plotter.plot_epoch(i, force=True)

@@ -36,8 +36,8 @@ class HandleInfFlow(flows.Flow):
 class SVIFlow(MAFlow):
 
     def __init__(self, dimensions, flow_steps, lr, epochs, context_size=64, hidden_features=128,
-                 batch_size=256, kl_warmup=0.2, kl_init_factor=0.5,
-                 n_samples=50, grad_clip_norm=None, use_iwae=False, device=None):
+                 batch_size=256, kl_warmup=0.2, kl_init_factor=0.5, kl_multiplier=4.,
+                 n_samples=50, grad_clip_norm=None, use_iwae=False, scheduler_kwargs=None, device=None):
         super().__init__(
             dimensions, flow_steps, lr, epochs, batch_size, device
         )
@@ -45,10 +45,12 @@ class SVIFlow(MAFlow):
         self.hidden_features = hidden_features
         self.kl_warmup = kl_warmup
         self.kl_init_factor = kl_init_factor
+        self.kl_multiplier = kl_multiplier
         
         self.n_samples = n_samples
         self.grad_clip_norm = grad_clip_norm
         self.use_iwae = use_iwae
+        self.scheduler_kwargs = scheduler_kwargs
 
         self.model = VariationalAutoencoder(
             prior=self._create_prior(),
@@ -145,19 +147,16 @@ class SVIFlow(MAFlow):
             generator=g,
             worker_init_fn=worker_init_fn
         )
-
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimiser,
-            mode='max',
-            factor=0.8,
-            patience=20,
-            verbose=True,
-            threshold=1e-6
-        )
+        _scheduler_kwargs = dict(factor=0.3,
+                                patience=10,
+                                verbose=True,
+                                threshold=1e-4)
+        scheduler_kwargs = {} if self.scheduler_kwargs is None else self.scheduler_kwargs
+        _scheduler_kwargs.update(scheduler_kwargs)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimiser, **_scheduler_kwargs)
         bar = tqdm(range(self.epochs), disable=not show_bar, unit='epochs', smoothing=1)
         train_loss = 0.0
         val_loss = 0.0
-        kl_multiplier = 1.
         checkpoint = self.checkpoint_fitting(optimiser, scheduler)
 
         for iepoch in bar:
@@ -179,14 +178,14 @@ class SVIFlow(MAFlow):
                         objective, (logl, kl) = self.model.log_prob_lower_bound(
                             d,
                             num_samples=self.n_samples,
-                            kl_multiplier=kl_multiplier,
+                            kl_multiplier=self.kl_multiplier,
                             separate=True
                         )
                     else:
                         objective, (logl, kl) = self.model.stochastic_elbo(
                             d,
                             num_samples=self.n_samples,
-                            kl_multiplier=kl_multiplier,
+                            kl_multiplier=self.kl_multiplier,
                             separate=True
                         )
                     torch.set_default_tensor_type(torch.FloatTensor)
@@ -224,7 +223,7 @@ class SVIFlow(MAFlow):
                         use_cuda=use_cuda,
                         num_workers=num_workers
                     ) * minibatch_scaling
-                    bar.desc = f'loss[train|val], [logl|kl]: {train_loss:.4f} | {val_loss:.4f}, {logls:.4f} | {kls:.4f}'
+                    bar.desc = f'loss[train|val], logl, kl: [{train_loss:.4f} | {val_loss:.4f}], {logls:.4f}, {kls:.4f}'
                     scheduler.step(val_loss)
                 else:
                     bar.desc = f'loss[train], [logl|kl]: {train_loss:.4f}, {logls:.4f} | {kls:.4f}'
@@ -315,7 +314,7 @@ class SVIFlow(MAFlow):
         log_w = log_p_x + log_p_z - log_q_z
         log_w = utils.split_leading_dim(log_w, [-1, num_samples])
         log_w[torch.isnan(log_w)] = -torch.inf
-        log_w -= torch.logsumexp(log_w, dim=-1)[:, None]
+        # log_w -= torch.logsumexp(log_w, dim=-1)[:, None]
         log_w[~torch.isfinite(log_w)] = torch.finfo().min
         
         samples = utils.split_leading_dim(samples, [-1, num_samples])
