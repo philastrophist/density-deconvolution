@@ -1,8 +1,10 @@
 from copy import deepcopy
+from typing import List
 
 import numpy as np
 import torch
 import torch.utils.data as data_utils
+from nflows.transforms import CompositeTransform
 from torch.nn.utils import clip_grad_norm_
 
 from nflows import flows, transforms, utils
@@ -12,6 +14,7 @@ from tqdm import tqdm
 from .distributions import DeconvGaussian
 from .maf import MAFlow
 from .nn import DeconvInputEncoder
+from .transforms import PositiveOnly
 from .vae import VariationalAutoencoder
 from ..utils.sampling import minibatch_sample
 
@@ -28,7 +31,9 @@ class HandleInfFlow(flows.Flow):
     def _log_prob(self, inputs, context):
         embedded_context = self._embedding_net(context)
         noise, logabsdet = self._transform(inputs, context=embedded_context)
-        noise = torch.where(torch.isfinite(noise), noise, torch.scalar_tensor(-1e+10, dtype=noise.dtype))
+        # noise = torch.where(torch.isfinite(noise), noise, torch.scalar_tensor(-1e+10, dtype=noise.dtype))
+        # noise is a standard norm, so just set points that are really far away to a really small number to prevent overflows
+        noise = torch.where(torch.abs(noise) < 1e+5, noise, torch.scalar_tensor(1e+5, dtype=noise.dtype))
         log_prob = self._distribution.log_prob(noise, context=embedded_context) + logabsdet
         return torch.where(torch.isfinite(log_prob), log_prob, torch.scalar_tensor(-1e+10, dtype=log_prob.dtype))
 
@@ -37,7 +42,12 @@ class SVIFlow(MAFlow):
 
     def __init__(self, dimensions, flow_steps, lr, epochs, context_size=64, hidden_features=128,
                  batch_size=256, kl_warmup=0.2, kl_init_factor=0.5, kl_multiplier=4.,
-                 n_samples=50, grad_clip_norm=None, use_iwae=False, scheduler_kwargs=None, device=None):
+                 positive_dims: List[int] = None, positive_scalings=None,
+                 n_samples=50, grad_clip_norm=None, use_iwae=False, use_diag_errs=False,
+                 scheduler_kwargs=None, device=None):
+        self.positive_dims = positive_dims
+        self.positive_scalings = positive_scalings
+        self.use_diag_errs = use_diag_errs
         super().__init__(
             dimensions, flow_steps, lr, epochs, batch_size, device
         )
@@ -55,7 +65,7 @@ class SVIFlow(MAFlow):
         self.model = VariationalAutoencoder(
             prior=self._create_prior(),
             approximate_posterior=self._create_approximate_posterior(),
-            likelihood=self._create_likelihood(),
+            likelihood=self._create_likelihood(self.use_diag_errs),
             inputs_encoder=self._create_input_encoder()
         )
 
@@ -63,30 +73,32 @@ class SVIFlow(MAFlow):
 
     def _create_prior(self):
         self.transform = self._create_transform(context_features=None, hidden_features=self.hidden_features)
+        if self.positive_dims:
+            self.transform = CompositeTransform([PositiveOnly(self.positive_dims, self.positive_scalings), self.transform])
         distribution = StandardNormal((self.dimensions,))
         return HandleInfFlow(
             self.transform,
-            distribution
+            distribution,
+            embedding_net=None
         )
 
-    def _create_likelihood(self):
+    def _create_likelihood(self, use_diag_errs):
         return DeconvGaussian()
 
     def _create_input_encoder(self):
-        return DeconvInputEncoder(self.dimensions, self.context_size)
+        return DeconvInputEncoder(self.dimensions, self.context_size, self.use_diag_errs)
 
     def _create_approximate_posterior(self):
 
         distribution = StandardNormal((self.dimensions,))
 
         posterior_transform = self._create_transform(self.context_size, hidden_features=self.hidden_features)
-
-        return HandleInfFlow(
-            transforms.InverseTransform(
-                posterior_transform
-            ),
-            distribution
-        )
+        inv = transforms.InverseTransform(posterior_transform)
+        if self.positive_dims:
+            posterior_transform = CompositeTransform([PositiveOnly(self.positive_dims, self.positive_scalings), inv])
+        else:
+            posterior_transform = inv
+        return HandleInfFlow(posterior_transform, distribution)
 
     def _kl_factor(self, step, max_steps):
 

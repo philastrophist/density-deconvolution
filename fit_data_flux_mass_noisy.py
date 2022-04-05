@@ -11,6 +11,7 @@ import pandas as pd
 import torch
 from astropy import units as u
 from astropy.cosmology import Planck18
+from astropy.table import Table
 from chainconsumer.helpers import get_grid_bins, get_smoothed_bins
 from chainconsumer.plotter import Plotter
 from functorch import jacrev, vmap
@@ -21,7 +22,8 @@ from nflows import utils
 from scipy import optimize
 from scipy.interpolate import interp1d
 from torch.autograd import Function
-from torch.distributions import MultivariateNormal
+from torch.distributions import MultivariateNormal, Normal
+from tqdm import tqdm
 
 from deconv.flow.svi import SVIFlow
 from deconv.gmm.data import DeconvDataset
@@ -39,18 +41,40 @@ def set_seed(seed):
     np.random.seed(seed)
     torch.manual_seed(seed)
 
+from custom_xdgmm import GeneralisedXDGMM as XDGMM
+
 
 def jacobianBatch(f, x):
   return vmap(jacrev(f))(x)
+
+
+def random_catalogue_match_fields(real_catalogue, random_fluxes):
+    """
+    1. value_count field
+    2. extract 1 random flux for each occurance of each field
+    3. assign to real_catalogue
+    """
+    randomised = pd.DataFrame(index=real_catalogue.index, columns=['flux', 'err'])
+    counts = real_catalogue.field.value_counts()
+    selected = []
+    for field, count in tqdm(counts.items(), total=len(counts)):
+        subset = random_fluxes[random_fluxes.field == field]
+        choice = np.random.randint(0, len(subset), count)
+        subset = subset.iloc[choice]
+        randomised.loc[real_catalogue.field == field, 'flux'] = subset['flux'].values
+        randomised.loc[real_catalogue.field == field, 'err'] = subset['err'].values
+        selected.append(subset.index.values)
+    return randomised.applymap(float), np.concatenate(selected)
 
 
 SEED = 1234
 set_seed(SEED)
 
 
-data_file = '~/star-forming/data/sdss-overlapped.csv'
+data_file = '~/star-forming/data/sdss-magnitudes-joined.csv'
 random_model_file = "~/star-forming/data/noise-16comps_seed0_tol1e-08.h5"
 random_apertures_file = "~/star-forming/data/merged-random-apertures-radius10.0seed0tagagain2.fits"
+random_ncomps = 16
 random_apertures_flux_name = 'flux'
 random_apertures_err_name = "err"
 random_apertures_flux_correction = 1/0.17880991378554684
@@ -58,8 +82,7 @@ data_flux_correction = 1.
 data_flux_name = 'forced_150_flux'
 data_err_name = 'forced_150_flux_err'
 fake_catalogue = False
-random_apertures_sane_flux_cutoff = 1000
-ncomp_real=1
+random_apertures_sane_flux_cutoff = 0.2
 df = pd.read_csv(data_file).set_index('objid')
 
 df[data_flux_name] *= data_flux_correction
@@ -70,10 +93,51 @@ overlapped = df#.query(filter)
 finite = np.isfinite(overlapped[[data_flux_name, data_err_name]]).all(axis=1) & (overlapped[data_err_name] > 0)
 overlapped = overlapped[finite].sample(frac=1, random_state=SEED)
 
+# now read in the random apertures
+if not Path(random_model_file).expanduser().exists():
+    random = Table.read(Path(random_apertures_file).expanduser()).to_pandas()
+    try:
+        random['field'] = random['field'].apply(lambda x: x.decode())
+    except AttributeError:
+        pass
+    random[random_apertures_flux_name] *= random_apertures_flux_correction
+    random[random_apertures_err_name] *= random_apertures_flux_correction
+    random[random_apertures_flux_name] = random[random_apertures_flux_name].apply(float)
+    random[random_apertures_err_name] = random[random_apertures_err_name].apply(float)
+    random = random[random[random_apertures_flux_name] < random_apertures_sane_flux_cutoff]
+
+    randomised, selected_indexes = random_catalogue_match_fields(overlapped, random)
+    if fake_catalogue:
+        # make sure we don't get the same random sample
+        fake = random_catalogue_match_fields(overlapped, random[~random.isin(selected_indexes)])[0]
+        overlapped[data_flux_name] = fake[random_apertures_flux_name]
+        overlapped[data_err_name] = fake[random_apertures_err_name]
+
+    cov_random = np.zeros([len(random), 1, 1])
+    cov_random[:, 0, 0] = random[random_apertures_err_name].values ** 2.
+    X_random = random[random_apertures_flux_name].values[:, None]
+
+    random_xdgmm = XDGMM(random_ncomps, n_iter=1000)
+    random_xdgmm.fit(X_random, cov_random)
+else:
+    random_xdgmm = XDGMM.from_file(Path(random_model_file).expanduser())
 
 def luminosity(flux, redshift, scale=1.):
     dl = Planck18.luminosity_distance(redshift)
     return (flux * u.mJy * 4 * np.pi * dl**2).to(u.W / u.Hz).value / (1 + redshift)**(-1-0.71) / scale
+
+def set_large_uncertainty(table, name, err_name, perc_width=99., multipler=2, other_filt=None, ivar=False):
+    filt = (table[err_name] <= 0) | ~np.isfinite(table[err_name]) | ~np.isfinite(table[name])
+    if other_filt is not None:
+        filt &= other_filt
+    if sum(filt):
+        print(f'setting {sum(filt)} {err_name} to {multipler} * {perc_width}%')
+        table[name][filt] = table[name][~filt].mean()
+        width = np.percentile(table[name][~filt], (100-perc_width, perc_width))
+        x = (width[1] - width[0]) * multipler
+        if ivar:
+            x = 1 / x**2
+        table[err_name][filt] = x
 
 
 lum_scale=1e+21
@@ -82,42 +146,55 @@ redshift_filt = (overlapped['redshift_err'].values / overlapped.redshift.values)
 redshift_filt &= overlapped.zwarning == 0
 print(f"bad redshifts: {sum(~redshift_filt)}")
 
+line_filt = np.ones(len(overlapped), dtype=bool)
 lines = 'h_alpha_flux h_beta_flux nii_6584_flux oiii_5007_flux'.split()
-line_filt = np.ones_like(redshift_filt, dtype=bool)
 for line in lines:
-    line_filt &= (np.abs(overlapped[line]) < 1e+4) & (overlapped[line+'_err'] > 0) & np.isfinite(overlapped[line+'_err'])
+    line_filt &= np.abs(overlapped[line]) < 1e+4
 print(f"outlier line fluxes: {sum(~line_filt)}")
 overlapped = overlapped[redshift_filt & line_filt]
-print(f"using {len(overlapped)} data points")
-# data dimensions to use:
-# L150
-# redshift
-# M*
-# ha, hb, nii, oiii
+for line in lines:
+    set_large_uncertainty(overlapped, line, line+'_err')  # set unknown to large variance
+set_large_uncertainty(overlapped, 'D4000', 'D4000_ERR')
+overlapped['lgm_tot_p50_err'] = (overlapped['lgm_tot_p84'] - overlapped['lgm_tot_p16']) / 2
+set_large_uncertainty(overlapped, 'lgm_tot_p50', 'lgm_tot_p50_err')
+set_large_uncertainty(overlapped, 'cModelFlux_r', 'cModelFluxIvar_r', ivar=True)
+
+radio_flux_scaling = 100.
+
 Xdata = torch.tensor(np.stack([
-    # luminosity(overlapped[data_flux_name].values, overlapped.redshift.values, lum_scale),
+    overlapped[data_flux_name] * radio_flux_scaling,
     overlapped.redshift.values,
     overlapped.lgm_tot_p50.values,
-    # overlapped.h_alpha_flux.values / line_scale,
-    # overlapped.h_beta_flux.values / line_scale,
-    # overlapped.nii_6584_flux.values / line_scale,
-    # overlapped.oiii_5007_flux.values / line_scale,
+    overlapped.h_alpha_flux.values,
+    overlapped.h_beta_flux.values,
+    overlapped.nii_6584_flux.values,
+    overlapped.oiii_5007_flux.values,
+    overlapped.D4000.values,
+    # overlapped.cModelFlux_r.values,
+    overlapped.cModelMag_r.values,
+
 ]).T.astype(np.float32))
-cov = np.zeros([len(overlapped), Xdata.shape[1], Xdata.shape[1]], dtype=np.float32)
-# cov[:, 0, 0] = luminosity(overlapped[data_err_name].values, overlapped.redshift.values, lum_scale)
-cov[:, 0, 0] = overlapped['redshift_err'].values
-# cov[:, 2, 2] = ((overlapped['lgm_tot_p84'] - overlapped['lgm_tot_p16']) / 2).values
-# cov[:, 3, 3] = overlapped['h_alpha_flux_err'].values / line_scale
-# cov[:, 4, 4] = overlapped['h_beta_flux_err'].values / line_scale
-# cov[:, 5, 5] = overlapped['nii_6584_flux_err'].values / line_scale
-# cov[:, 6, 6] = overlapped['oiii_5007_flux_err'].values / line_scale
-# cov[:, 1-1, 1-1] = overlapped['redshift_err'].values
-cov[:, 1, 1] = ((overlapped['lgm_tot_p84'] - overlapped['lgm_tot_p16']) / 2).values
-cov = torch.tensor(cov)**2.
+Xerr = torch.tensor(np.stack([
+    overlapped[data_err_name] * radio_flux_scaling,
+    overlapped['redshift_err'].values,
+    ((overlapped['lgm_tot_p84'] - overlapped['lgm_tot_p16']) / 2).values,
+    overlapped['h_alpha_flux_err'].values,
+    overlapped['h_beta_flux_err'].values,
+    overlapped['nii_6584_flux_err'].values,
+    overlapped['oiii_5007_flux_err'].values,
+    overlapped['D4000_ERR'].values,
+    overlapped['cModelMagErr_r'].values,
+    # np.sqrt(1 / overlapped['cModelFluxIvar_r'].values)  # gets squared later
+]).T.astype(np.float32))
+
+cov = torch.diag_embed(Xerr)**2.
+
+assert torch.isfinite(cov).all().numpy()
+assert torch.isfinite(Xerr).all().numpy()
+assert torch.isfinite(Xdata).all().numpy()
 
 
 # TODO test normalising data a little better
-scaling = 100
 cap = 20.
 
 
@@ -127,7 +204,7 @@ def inv_logit(x):
 
 np.testing.assert_allclose(inv_logit(torch.logit(torch.scalar_tensor(0.3425))).numpy(), 0.3425)
 
-TransformPair = namedtuple('TransformPair', ['data2fitting', 'fitting2data', 'jacobian'])
+TransformPair = namedtuple('TransformPair', ['data2fitting', 'fitting2data', 'jacobian', 'prefilter'])
 
 def make_hard_bounder(x, base_transform=lambda x: x, buffer=0.001):
     """
@@ -164,81 +241,132 @@ def make_hard_bounder(x, base_transform=lambda x: x, buffer=0.001):
 
     return TransformPair(_data2fitting, _fitting2data, _jacobian)
 
-def ztransform(x, transform, data):
-    p = transform(data)
-    return (transform(x) - p.mean()) / p.std()
 
-def inv_ztransform(x, transform, data):
-    p = transform(data)
-    return (x * p.std()) + p.mean()
+def make_data_transform(data, function=None, inv_function=None,
+                   inv_jacobian=None, prefilter=None):
+    """
+    Make a normalising transform on function(x) given function(data)
+    after removing from data those values which do not satisfy `prefilter` condition.
+    data: the observed dataset, all of it
+    function: is the function that maps from data to fitting space
+    inv_function: is the function that maps from fitting space to data space
+    inv_jacobian: is the jacobian of the inverse function
+    prefilter: is the function that returns True/False to include data in the calculation of mean and std
+                if the transform is log/exp then you should prefilter with x > 0
+    """
+    if prefilter is None:
+        original = data
+    else:
+        original = data[prefilter(data)]
+    if function is None:
+        function = lambda x: x
+        inv_function = lambda x: x
+        inv_jacobian = lambda x, y: torch.ones_like(x)
+    elif inv_jacobian is None or inv_function is None:
+        raise ValueError(f"If you define `function` you must define its inverse and the inverse's jacobian")
+    transformed = function(original)
+    mu, std = transformed.mean(dim=0), transformed.std(dim=0)
 
-def jac_ztransform_multiplier(transform, data):
-    p = transform(data)
-    return p.std()
+    def forward(x):
+        return (function(x) - mu) / std
 
-redshift_bounder = make_hard_bounder(Xdata[:, 1-1])
+    def backward(y):
+        return inv_function((y * std) + mu)
+
+    def jac(x, y):
+        """
+        df^{-1}(y) / dy
+        where y is the fitting and x is the data
+        """
+        return torch.clamp(inv_jacobian(x, y) * std, min=1e-30)
+
+    return TransformPair(forward, backward, jac, prefilter)
+
+
+def make_uncertainty_transform(data, uncertainty):
+    def function(x, xerr):
+        return torch.log(torch.abs(xerr / x))
+
+    def inv_function(x, ylogsnr):
+        return torch.abs(torch.exp(ylogsnr) * x)
+
+    transformed = function(data, uncertainty)
+    mu, std = transformed.mean(dim=0), transformed.std(dim=0)
+    def forward(x, xerr):
+        return (function(x, xerr) - mu) / std
+
+    def backward(x, ylogsnr):
+        return inv_function(x, (std * ylogsnr) + mu)
+
+    return TransformPair(forward, backward, None, None)
+
+
+radio_flux_transform = make_data_transform(Xdata[:, 0], torch.asinh,
+                                           lambda y: torch.sinh(torch.clamp(y, -cap, cap)),
+                                           lambda x, y: torch.cosh(torch.clamp(y, -cap, cap)))
+redshift_transform = make_data_transform(Xdata[:, 1])
+mass_transform = make_data_transform(Xdata[:, 2])
+line_transforms = [make_data_transform(Xdata[:, i],
+                                       torch.asinh,
+                                       lambda y: torch.sinh(torch.clamp(y, -cap, cap)),
+                                       lambda x, y: torch.cosh(torch.clamp(y, -cap, cap)))
+                   for i in range(3, 7)]
+d4000_transform = make_data_transform(Xdata[:, 7])
+rflux_transform = make_data_transform(Xdata[:, 8])
+# rflux_transform = make_data_transform(Xdata[:, 8], torch.asinh,
+#                                            lambda y: torch.sinh(torch.clamp(y, -cap, cap)),
+#                                            lambda x, y: torch.cosh(torch.clamp(y, -cap, cap)))
+
+data_transforms = [radio_flux_transform, redshift_transform, mass_transform] + line_transforms + [d4000_transform, rflux_transform]
+error_transform = make_uncertainty_transform(Xdata, Xerr)
+
 
 def data2fitting(x):
-    x = x.T
-    return torch.stack([
-        # torch.asinh(x[0] * scaling),
-        ztransform(x[0], lambda x: x, Xdata[:, 0]), #redshift_bounder.data2fitting(x[1]),
-        ztransform(x[1], lambda x: x, Xdata[:, 1]),
-        # ztransform(x[3], torch.asinh, Xdata[:, 3]),
-        # ztransform(x[4], torch.asinh, Xdata[:, 4]),
-        # ztransform(x[5], torch.asinh, Xdata[:, 5]),
-        # ztransform(x[6], torch.asinh, Xdata[:, 6])
-    ]).T
-# data2fitting.names = ['asinh(scaled_L150)', 'logit(z)', 'logM-10.5', 'asinh(ha)', 'asinh(hb)', 'asinh(nii)', 'asinh(oiii)']
-data2fitting.names = ['z', 'logM']
+    """
+    Transform the data matrix x into the fitting regime
+    if generated_samples is True, x is assumed to have been generated from our model before
+    """
+    return torch.stack([t.data2fitting(xi) for xi, t in zip(x.T, data_transforms)]).T
+data2fitting.names = ['asinh(f150_scaled)', 'z', 'logM', 'asinh(ha)', 'asinh(hb)', 'asinh(nii)', 'asinh(oiii)',
+                      'D4000', 'cMag_r']
 
-def fitting2data(x):
-    x = x.T
-    return torch.stack([
-        # torch.sinh(torch.clamp(x[0], -cap, cap)) / scaling,
-        # redshift_bounder.fitting2data(torch.clamp(x[1-1], -10., 10.)),
-        inv_ztransform(x[0], lambda x: x, Xdata[:, 0]),
-        inv_ztransform(x[1], lambda x: x, Xdata[:, 1]),
-        # torch.sinh(torch.clamp(inv_ztransform(x[3], torch.asinh, Xdata[:, 3]), -cap, cap)),
-        # torch.sinh(torch.clamp(inv_ztransform(x[4], torch.asinh, Xdata[:, 4]), -cap, cap)),
-        # torch.sinh(torch.clamp(inv_ztransform(x[5], torch.asinh, Xdata[:, 5]), -cap, cap)),
-        # torch.sinh(torch.clamp(inv_ztransform(x[6], torch.asinh, Xdata[:, 6]), -cap, cap)),
-    ]).T
-# fitting2data.names = ['scaled_L150', 'z', 'logM', 'ha', 'hb', 'nii', 'oiii']
-fitting2data.names = ['z', 'logM']
+def fitting2data(y):
+    """
+    Transform the fitting matrix x into the data regime
+    if generated_samples is True, x is assumed to have been generated from our model before
+    """
+    return torch.stack([t.fitting2data(yi) for yi, t in zip(y.T, data_transforms)]).T
+fitting2data.names = ['f150_scaled', 'z', 'logM', 'ha', 'hb', 'nii', 'oiii', 'D4000', 'cMag_r']
 
-def jacobian(x):
-    J = torch.zeros((x.shape[0], x.shape[1], x.shape[1]))
-    J[:, 0, 0] = jac_ztransform_multiplier(lambda x: x, Xdata[:, 0]) #torch.cosh(torch.clamp(x[:, 0], -cap, cap)) / scaling
-    J[:, 1, 1] = jac_ztransform_multiplier(lambda x: x, Xdata[:, 1])
-    #redshift_bounder.jacobian(torch.clamp(x[:, 1-1], -10., 10.))
-    # J[:, 3, 3] = torch.cosh(torch.clamp(x[:, 3], -cap, cap)) * jac_ztransform_multiplier(torch.asinh, Xdata[:, 3])
-    # J[:, 4, 4] = torch.cosh(torch.clamp(x[:, 4], -cap, cap)) * jac_ztransform_multiplier(torch.asinh, Xdata[:, 4])
-    # J[:, 5, 5] = torch.cosh(torch.clamp(x[:, 5], -cap, cap)) * jac_ztransform_multiplier(torch.asinh, Xdata[:, 5])
-    # J[:, 6, 6] = torch.cosh(torch.clamp(x[:, 6], -cap, cap)) * jac_ztransform_multiplier(torch.asinh, Xdata[:, 6])
-    return J
+
+def jacobian(x, y):
+    """
+    Returns jacobian, is_diag={True/False}
+    """
+    return torch.stack([t.jacobian(xi, yi) for xi, yi, t in zip(x.T, y.T, data_transforms)]).T, True
+
 
 def data2auxillary(x):
     """
     Adds other dimension that may be used for plotting/diagnostics etc
     Not used in the actual fit
     """
-    return torch.tensor([[]], dtype=Xfitting.dtype).T
-    # x = x.T
-    # return torch.stack([
-    #     torch.log10(x[0]*lum_scale),
-    #     torch.log10(x[-2]) - torch.log10(x[-4]),  # line_scale is not needed since it's a ratio
-    #     torch.log10(x[-1]) - torch.log10(x[-3])
-    #     ]).T
-# data2auxillary.names = ['log(L150)', 'log(nii / Ha)', 'log(oiii / Hb)']
-data2auxillary.names = []
+    # return torch.tensor([[]], dtype=Xfitting.dtype).T
+    x = x.T
+    return torch.stack([
+        torch.log10(x[3]) - torch.log10(x[5]),  # line_scale is not needed since it's a ratio
+        torch.log10(x[4]) - torch.log10(x[6]),
+        # 22.5 - (2.5 * torch.log10(x[-1])),
+    ]).T
+data2auxillary.names = ['log(nii / Ha)', 'log(oiii / Hb)']#, 'cmag_r']
 
 
 from chainconsumer import ChainConsumer
 
 
-Xfitting = data2fitting(Xdata)
-np.testing.assert_allclose(fitting2data(Xfitting), Xdata, 2e-6)
+Xfitting = data2fitting(Xdata)  # will contain nans from fluxes
+Xerrfitting = error_transform.data2fitting(Xdata, Xerr)
+np.testing.assert_allclose(fitting2data(Xfitting), Xdata, rtol=0.07)
 
 class DeconvGaussianTransformed(Distribution):
     """
@@ -247,30 +375,59 @@ class DeconvGaussianTransformed(Distribution):
     You also specify a transform from fitting space to data space. In this case, the uncertainty
     is assumed to be defined in the data space, not the fitting space.
     """
-    def __init__(self, fitting2data, data2fitting):
+
+    def __init__(self, use_diag_errs) -> None:
         super().__init__()
-        self.data2fitting = data2fitting
-        self.fitting2data = fitting2data
+        self.use_diag_errs = use_diag_errs
+
+    def convolve_noise(self, observed, observed_err_tril, intrinsic):
+        """
+        observed: contains actual flux data, can be negative or positive
+        observed_err_tril: contains observed flux error tril matrix
+        intrinsic: the "true" values generated by the model
+        returns: P(data|intrinsic,data_err) == p(w|v)
+        """
+        logps = []
+        for mu, sigma, alpha in zip(random_xdgmm.mu, random_xdgmm.V, random_xdgmm.alpha):
+            mu = torch.as_tensor(mu)
+            sigma = torch.as_tensor(sigma)
+            if self.use_diag_errs:
+                err = torch.sqrt(observed_err_tril[:, 0]**2. + sigma[0, 0])
+            else:
+                err = torch.sqrt(observed_err_tril[:, 0, 0] + sigma[0, 0])
+            flux_logp = Normal(loc=mu+intrinsic[:, 0], scale=err).log_prob(observed[:, 0])
+            logps.append(flux_logp + torch.log(torch.as_tensor(alpha, dtype=err.dtype)))
+        flux_logp = torch.logsumexp(torch.stack(logps), dim=0)
+        other_logps = []
+        if self.use_diag_errs:
+            for i in range(1, observed.shape[1]):
+                other_logps.append(Normal(loc=intrinsic[:, i], scale=observed_err_tril[:, i]).log_prob(observed[:, i]))
+            return flux_logp + sum(other_logps)
+        return LocDifferentiableMultivariateNormal(loc=intrinsic, scale_tril=observed_err_tril).log_prob(observed)
 
     def log_prob(self, inputs, context):
-        X, noise_l = inputs  # fitting space, data space
-        # transform samples to the data space where the uncertainties live
-        jac = jacobian(context)  #jacobianBatch(self.fitting2data, context_fittingspace)
-        context_dataspace = self.fitting2data(context)
-        log_scaling = torch.slogdet(jac)[1]
-        Z = self.fitting2data(X)
+        Z, noise_l = inputs  # data space
+        X = fitting2data(Z)
+        if self.use_diag_errs:
+            noise_l = error_transform.fitting2data(X, noise_l)
+        context_dataspace = fitting2data(context)
+        jac, is_diag = jacobian(context_dataspace, context)
+        if is_diag:
+            log_scaling = torch.log(jac).sum(axis=1)
+        else:
+            log_scaling = torch.slogdet(jac)[1]
         context_dataspace = torch.where(torch.isfinite(context_dataspace), context_dataspace,
                                           torch.scalar_tensor(torch.finfo(context_dataspace.dtype).min,
                                                               dtype=context_dataspace.dtype))
         log_scaling = torch.where(torch.isfinite(log_scaling), log_scaling,
                                           torch.scalar_tensor(torch.finfo(log_scaling.dtype).min,
                                                               dtype=log_scaling.dtype))
-        return LocDifferentiableMultivariateNormal(loc=context_dataspace, scale_tril=noise_l).log_prob(Z) + log_scaling
+        return self.convolve_noise(X, noise_l, context_dataspace) + log_scaling
 
 
 class MySVIFlow(SVIFlow):
-    def _create_likelihood(self):
-        return DeconvGaussianTransformed(fitting2data, data2fitting)
+    def _create_likelihood(self, use_diag_errs=False):
+        return DeconvGaussianTransformed(use_diag_errs)
 
 
 class MyPlotter(Plotter):
@@ -414,7 +571,9 @@ class MyChainConsumer(ChainConsumer):
 
 
 def plot_samples(chains, record_df=None, c=None,
-                 parameters=None, log_scales=None, perc=(0.0001, 99.), log_densities=False):
+                 parameters=None, log_scales=None, perc=(0.0001, 99.),
+                 log_densities=False,
+                 focus=None):
     if c is None:
         c = MyChainConsumer()
     else:
@@ -448,10 +607,19 @@ def plot_samples(chains, record_df=None, c=None,
         warnings.simplefilter("ignore", UserWarning)
         c.plotter.plot(parameters=parameters, log_scales=log_scales)
     if not hasattr(c, 'axins_losses') and record_df is not None:
-        if np.size(c.plotter.fig_data[1]) == 1:
-            c.axins_losses = c.plotter.fig_data[0].add_axes([0.2, 0.6, 0.3, 0.3])
-        else:
-            c.axins_losses = c.plotter.fig_data[0].add_axes([0.6, 0.6, 0.3, 0.3])
+        c.axins_losses = c.plotter.fig_data[0].add_axes([0.5, 0.6, 0.4, 0.3])
+        # axes = [ax.get_position() for ax in c.plotter.fig_data[1][0] if not ax.get_frame_on()]
+        # if np.size(c.plotter.fig_data[1]) == 1:
+        #     c.axins_losses = c.plotter.fig_data[0].add_axes([0.2, 0.6, 0.3, 0.3])
+        # elif np.size(c.plotter.fig_data[1]) == 2:
+        #     c.axins_losses = c.plotter.fig_data[0].add_axes(axes[0])
+        # else:
+        #     axes = [ax.get_position() for ax in c.plotter.fig_data[1][0]]
+        #     c.axins_losses = c.plotter.fig_data[0].add_axes(axes[0])
+        #     mn = min([ax.x0 for ax in axes]), min([ax.y0 for ax in axes])
+        #     mx = max([ax.x0+ax.width for ax in axes]), max([ax.y0+ax.height for ax in axes])
+        #     pos = mn + (mx[0] - mn[0], mx[1] - mn[1])
+        #     c.axins_losses = c.plotter.fig_data[0].add_axes(pos)
         c.axins_losses_twin = c.axins_losses.twinx()
     if record_df is not None:
         if len(record_df):
@@ -461,22 +629,26 @@ def plot_samples(chains, record_df=None, c=None,
             c.axins_losses_twin.plot(range(len(record_df)), record_df['val'], 'r-', label='val')
             c.axins_losses.set_xlim(max([0, max(record_df['epoch']) - 20]), max(record_df['epoch']))
         autoscale_y(c.axins_losses)
+        autoscale_y(c.axins_losses_twin)
         c.axins_losses.legend(loc='lower right')
         plt.suptitle(f'epoch {len(record_df)}')
     return c
 
 S = cov
 partition = 10
+# TODO: errors should be normalised as well!
+# TODO: bound our model > 0 - done
+# TODO: do this in the prior/posterior flow definitions after the transforms - done
 X_test = Xfitting[:Xfitting.shape[0] // partition]
-S_test = S[:S.shape[0] // partition]
+S_test = Xerrfitting[:Xerrfitting.shape[0] // partition]
 X_train = Xfitting[Xfitting.shape[0] // partition:]
-S_train = S[S.shape[0] // partition:]
+S_train = Xerrfitting[Xerrfitting.shape[0] // partition:]
 print(f"validation={len(X_test)}, training={len(X_train)} ({1 / partition:.2%})")
 
-train_data = DeconvDataset(X_train[:5000], torch.linalg.cholesky(S_train)[:5000])
-test_data = DeconvDataset(X_test, torch.linalg.cholesky(S_test))
+train_data = DeconvDataset(X_train[:5000], S_train[:5000], diag=True)
+test_data = DeconvDataset(X_test, S_test, diag=True)
 
-directory = Path('models/simpler-test-2d-100')
+directory = Path('models/noisy-all-uncut-trial2')
 space_dir = directory / 'plots'
 params_dir = directory / 'params'
 directory.mkdir(parents=True, exist_ok=True)
@@ -485,21 +657,24 @@ params_dir.mkdir(parents=True, exist_ok=True)
 print(f'saving to {directory}')
 
 total_epochs = 10_000
-start_from = 0
+start_from = 76
 svi = MySVIFlow(
     Xdata.shape[1],
     flow_steps=5,
     device= torch.device('cpu'),
     batch_size=2000,
     epochs=total_epochs,
-    lr=1e-3,
+    lr=1e-4,
     n_samples=100,
-    grad_clip_norm=None,
+    grad_clip_norm=1,
+    positive_dims=[0],
     kl_multiplier=1.,
     scheduler_kwargs={},  # add overrides here
     use_iwae=True,
+    use_diag_errs=True
 )
-
+prior_samples = svi.model._prior.sample(10_000)
+post_samples = svi.model._approximate_posterior.sample(10_000)
 if start_from > 0:
     svi.model.load_state_dict(torch.load(params_dir / f'{start_from}.pt'))
     df = pd.read_csv(directory / f'record.csv')
@@ -515,13 +690,6 @@ def iterator():
 
 
 iterations = iterator()
-
-
-Yfitting = svi.sample_prior(10000)[0]
-Ydata = fitting2data(Yfitting)
-Yaux = data2auxillary(Ydata)
-Xaux = data2auxillary(Xdata)
-
 
 def autoscale_y(ax,margin=0.05):
     """This function rescales the y-axis based on the data that is visible given the current xlim of the axis.
@@ -561,26 +729,31 @@ def save_epoch_to_disk(record_df, i, _svi, train_loss, val_loss, logl, kl):
     record_df.to_csv(directory / f'record.csv')
     return record_df
 
-def plot_epoch(i, _svi, record_df=None, chainconsumer=None, parameters=None,
+def plot_epoch(i, _svi, xfitting, record_df=None, chainconsumer=None, parameters=None,
                log_scales=None, perc=(0.0001, 99.), log_densities=False):
-    Yfitting = _svi.sample_prior(len(Xdata))[0]
-    Ydata = fitting2data(Yfitting)
+    yfitting = _svi.sample_prior(len(xfitting))[0]
+    ydata = fitting2data(yfitting)
     if chainconsumer is not None:
         for ax in chainconsumer.plotter.fig_data[0].axes:
             ax.clear()
-    Yaux = data2auxillary(Ydata)
-    Xaux = data2auxillary(Xdata)
-    chainconsumer = plot_samples(dict(observed=(Xdata, Xfitting, Xaux), fit=(Ydata, Yfitting, Yaux)), record_df, chainconsumer,
+    xdata = fitting2data(xfitting)
+    xaux = data2auxillary(xdata)
+    yaux = data2auxillary(ydata)
+    chainconsumer = plot_samples(dict(observed=(xdata, xfitting, xaux), fit=(ydata, yfitting, yaux)), record_df, chainconsumer,
                                  parameters, log_scales, perc, log_densities)
     fig = chainconsumer.plotter.fig_data[0]
     plt.suptitle(f'epoch {i}')
     return chainconsumer
 
-def plot_epoch_q(i, _svi, test_points, record_df=None, chainconsumer=None, parameters=None, log_scales=None,
+def plot_epoch_q(i, _svi, data_test_points, data_test_point_errs, record_df=None, chainconsumer=None, parameters=None, log_scales=None,
                  perc=(0.0001, 99.), log_densities=False, n=1_000_000):
+    data_test_points = torch.as_tensor(data_test_points).to(svi.device)
+    data_test_point_errs = torch.as_tensor(data_test_point_errs).to(svi.device)
+    fitting_test_points = data2fitting(data_test_points)
+    fitting_test_point_errs = error_transform.data2fitting(data_test_points, data_test_point_errs)
     Yfitting = _svi.sample_prior(n)[0]
-    Qfitting = utils.merge_leading_dims(_svi.sample_posterior(test_points, n), num_dims=2)
-    Pfitting = utils.merge_leading_dims(_svi.resample_posterior(test_points, n), num_dims=2)
+    Qfitting = utils.merge_leading_dims(_svi.sample_posterior([fitting_test_points, fitting_test_point_errs], n), num_dims=2)
+    Pfitting = utils.merge_leading_dims(_svi.resample_posterior([fitting_test_points, fitting_test_point_errs], n), num_dims=2)
     Ydata = fitting2data(Yfitting)
     Yaux = data2auxillary(Ydata)
     Qdata = fitting2data(Qfitting)
@@ -588,8 +761,12 @@ def plot_epoch_q(i, _svi, test_points, record_df=None, chainconsumer=None, param
     Pdata = fitting2data(Pfitting)
     Paux = data2auxillary(Pdata)
 
-    Udata = torch.as_tensor(np.concatenate([np.random.multivariate_normal(m, l @ l.T, size=n//len(test_points[0]))
-                                            for m, l in zip(fitting2data(test_points[0]), test_points[1])]), dtype=Yfitting.dtype)
+    try:
+        Udata = np.concatenate([np.random.multivariate_normal(m, l @ l.T, size=n//len(data_test_points))
+                                                for m, l in zip(data_test_points, data_test_point_errs)])
+    except ValueError:
+        Udata = np.random.normal(data_test_points, data_test_point_errs, size=(n, )+data_test_points.shape).reshape(-1, data_test_points.shape[-1])
+    Udata = torch.as_tensor(Udata, dtype=Yfitting.dtype)
     Ufitting = data2fitting(Udata)
     Uaux = data2auxillary(Udata)
     if chainconsumer is not None:
@@ -605,8 +782,7 @@ def plot_epoch_q(i, _svi, test_points, record_df=None, chainconsumer=None, param
     fig = chainconsumer.plotter.fig_data[0]
     plt.suptitle(f'epoch {i}')
     return chainconsumer
-# ani = animation.FuncAnimation(c.plotter.fig_data[0], animate_and_save_to_disk, interval=500, frames=iterations, repeat=False)
-# plt.show()
+
 if __name__ == '__main__':
     for i, o in iterations:
         df = save_epoch_to_disk(df, i, *o)

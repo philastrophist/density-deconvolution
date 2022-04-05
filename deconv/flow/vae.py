@@ -45,21 +45,27 @@ class VariationalAutoencoder(nn.Module):
         if self._inputs_encoder is None:
             posterior_context = inputs
         else:
-            posterior_context = self._inputs_encoder(inputs)
+            posterior_context = self._inputs_encoder(inputs)  # concats all obs and errs
+        # approx_posterior is a flow which uses all x,err to generate latent v `P(v|x,err)`
+        # x and err should both be normalised well
+        # if the approx_posterior should be bound in some way it should be done internally after transforms
         latents, log_q_z = self._approximate_posterior.sample_and_log_prob(
             num_samples,
             context=posterior_context
         )  # latents = "true `v` samples", known as `z` here
         mask = torch.isnan(latents)
         latents[mask] = 1.
-        # latents = torch.where(mask, torch.ones_like(latents), latents)
 
         latents = utils.merge_leading_dims(latents, num_dims=2)
         log_q_z = utils.merge_leading_dims(log_q_z, num_dims=2)
 
+        # prior is a flow which uses x to calculate `P(v)`
+        # if the prior should be bound in some way it should be done internally after transforms
         # Compute log prob of latents under the prior. prior is/becomes the model
         log_p_z = self._prior.log_prob(latents)  # produces -infs
 
+        # likelihood is a custom function which computes P(x|v,err)
+        # v could be bound as described above, {x,err} come directly from data
         # Compute log prob of inputs under the decoder,
         inputs = [utils.repeat_rows(i, num_reps=num_samples) for i in inputs]
         log_p_x = self._likelihood.log_prob(inputs, context=latents)  # produces -infs

@@ -6,14 +6,22 @@ import h5py
 
 class DeconvDataset(data_utils.Dataset):
 
-    def __init__(self, X, noise_covars):
+    def __init__(self, X, noise_covars, diag=False):
+        """
+        X               data array of (n, dims)
+        noise_covars    noise array of (n, dims, dims) or (n, dims) if diag is True
+        if diag is True, noise_covars is the std error array
+        """
         self.X = X
         self.noise_covars = noise_covars
+        self.diag = diag
 
     def __len__(self):
         return self.X.shape[0]
 
     def __getitem__(self, i):
+        if self.diag:
+            return self.X[i, :], self.noise_covars[i, :]
         return (self.X[i, :], self.noise_covars[i, :, :])
 
 

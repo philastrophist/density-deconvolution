@@ -8,14 +8,17 @@ from nflows.nn.nets import ResidualNet
 
 class DeconvInputEncoder(nn.Module):
 
-    def __init__(self, d, context_size):
+    def __init__(self, d, context_size, use_diag_errs=False):
 
         super().__init__()
+        self.use_diag_errs = use_diag_errs
 
-        idx = torch.tril_indices(d, d)
-        self.idx = (idx[0], idx[1])
-
-        input_size = int(d + d * (d + 1) / 2)
+        if use_diag_errs:
+            input_size = int(d * 2)
+        else:
+            idx = torch.tril_indices(d, d)
+            self.idx = (idx[0], idx[1])
+            input_size = int(d + d * (d + 1) / 2)
 
         self.resnet = ResidualNet(
             in_features=input_size,
@@ -30,8 +33,9 @@ class DeconvInputEncoder(nn.Module):
 
     def forward(self, inputs):
         x, noise_l = inputs
-
-        x = torch.cat((x, noise_l[:, self.idx[0], self.idx[1]]), dim=1)
-
+        if self.use_diag_errs:
+            x = torch.cat((x, noise_l), dim=1)
+        else:
+            x = torch.cat((x, noise_l[:, self.idx[0], self.idx[1]]), dim=1)
         return self.resnet(x)
 
