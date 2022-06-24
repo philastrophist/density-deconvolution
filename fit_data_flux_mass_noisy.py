@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import matplotlib.pylab as plt
+import nflows.transforms
 import numpy as np
 import pandas as pd
 import torch
@@ -19,6 +20,7 @@ from matplotlib import animation
 from matplotlib.ticker import MaxNLocator, LogLocator, ScalarFormatter
 from nflows.distributions import Distribution
 from nflows import utils
+from nflows.transforms import Sigmoid
 from scipy import optimize
 from scipy.interpolate import interp1d
 from torch.autograd import Function
@@ -67,7 +69,7 @@ def random_catalogue_match_fields(real_catalogue, random_fluxes):
     return randomised.applymap(float), np.concatenate(selected)
 
 
-SEED = 1234
+SEED = 12345
 set_seed(SEED)
 
 
@@ -150,6 +152,7 @@ line_filt = np.ones(len(overlapped), dtype=bool)
 lines = 'h_alpha_flux h_beta_flux nii_6584_flux oiii_5007_flux'.split()
 for line in lines:
     line_filt &= np.abs(overlapped[line]) < 1e+4
+    line_filt &= (overlapped[line+'_err'] > 0) & np.isfinite(overlapped[line+'_err'])
 print(f"outlier line fluxes: {sum(~line_filt)}")
 overlapped = overlapped[redshift_filt & line_filt]
 for line in lines:
@@ -186,6 +189,8 @@ Xerr = torch.tensor(np.stack([
     overlapped['cModelMagErr_r'].values,
     # np.sqrt(1 / overlapped['cModelFluxIvar_r'].values)  # gets squared later
 ]).T.astype(np.float32))
+
+varnames = ['f150', 'z', 'logM', 'ha', 'hb', 'nii', 'oiii', 'D4000', 'R']
 
 cov = torch.diag_embed(Xerr)**2.
 
@@ -243,14 +248,14 @@ def make_hard_bounder(x, base_transform=lambda x: x, buffer=0.001):
 
 
 def make_data_transform(data, function=None, inv_function=None,
-                   inv_jacobian=None, prefilter=None):
+                   function_jacobian=None, prefilter=None):
     """
     Make a normalising transform on function(x) given function(data)
     after removing from data those values which do not satisfy `prefilter` condition.
     data: the observed dataset, all of it
     function: is the function that maps from data to fitting space
     inv_function: is the function that maps from fitting space to data space
-    inv_jacobian: is the jacobian of the inverse function
+    function_jacobian: is the jacobian of the function that maps data->fitting
     prefilter: is the function that returns True/False to include data in the calculation of mean and std
                 if the transform is log/exp then you should prefilter with x > 0
     """
@@ -261,8 +266,8 @@ def make_data_transform(data, function=None, inv_function=None,
     if function is None:
         function = lambda x: x
         inv_function = lambda x: x
-        inv_jacobian = lambda x, y: torch.ones_like(x)
-    elif inv_jacobian is None or inv_function is None:
+        function_jacobian = lambda x, y: torch.ones_like(x)
+    elif function_jacobian is None or inv_function is None:
         raise ValueError(f"If you define `function` you must define its inverse and the inverse's jacobian")
     transformed = function(original)
     mu, std = transformed.mean(dim=0), transformed.std(dim=0)
@@ -278,9 +283,29 @@ def make_data_transform(data, function=None, inv_function=None,
         df^{-1}(y) / dy
         where y is the fitting and x is the data
         """
-        return torch.clamp(inv_jacobian(x, y) * std, min=1e-30)
+        return torch.clamp(function_jacobian(x, y) / std, min=1e-30)
 
     return TransformPair(forward, backward, jac, prefilter)
+
+def transform_from_flow_transform(data, Transform: nflows.transforms.Transform, prefilter, **kwargs):
+    transform = Transform(**kwargs)
+    return make_data_transform(data,  lambda x: transform.forward(x)[0],
+                               lambda x: transform.inverse(x)[1], lambda x: transform.inverse(x)[1],
+                               prefilter)
+
+class OffsetSigmoid(Sigmoid):
+
+    def __init__(self, temperature=1, eps=1e-6, offset=0.5, learn_temperature=False):
+        super().__init__(temperature, eps, learn_temperature)
+        self.offset = offset
+
+    def forward(self, inputs, context=None):
+        x, dx = super().forward(inputs, context)
+        return x - self.offset, dx
+
+    def inverse(self, inputs, context=None):
+        return super().inverse(inputs+self.offset, context)
+
 
 
 def make_uncertainty_transform(data, uncertainty):
@@ -313,11 +338,26 @@ line_transforms = [make_data_transform(Xdata[:, i],
                    for i in range(3, 7)]
 d4000_transform = make_data_transform(Xdata[:, 7])
 rflux_transform = make_data_transform(Xdata[:, 8])
-# rflux_transform = make_data_transform(Xdata[:, 8], torch.asinh,
-#                                            lambda y: torch.sinh(torch.clamp(y, -cap, cap)),
-#                                            lambda x, y: torch.cosh(torch.clamp(y, -cap, cap)))
+
+model_bounds = [
+    [0, 500],
+    [0.02, 0.09],
+    [2, 15],
+] + \
+    [[-10_000, 10_000]]*4 \
++ [
+    [0, 10],
+    [0, 20],
+]
 
 data_transforms = [radio_flux_transform, redshift_transform, mass_transform] + line_transforms + [d4000_transform, rflux_transform]
+
+selected_names = ['logM', 'R']
+indexes = [varnames.index(i) for i in selected_names]
+
+Xdata = Xdata[:, indexes]
+Xerr = Xerr[:, indexes]
+data_transforms = [data_transforms[i] for i in indexes]
 error_transform = make_uncertainty_transform(Xdata, Xerr)
 
 
@@ -327,8 +367,9 @@ def data2fitting(x):
     if generated_samples is True, x is assumed to have been generated from our model before
     """
     return torch.stack([t.data2fitting(xi) for xi, t in zip(x.T, data_transforms)]).T
-data2fitting.names = ['asinh(f150_scaled)', 'z', 'logM', 'asinh(ha)', 'asinh(hb)', 'asinh(nii)', 'asinh(oiii)',
-                      'D4000', 'cMag_r']
+# data2fitting.names = ['asinh(f150_scaled)', 'z', 'logM', 'asinh(ha)', 'asinh(hb)', 'asinh(nii)', 'asinh(oiii)',
+#                       'D4000', 'cMag_r']
+data2fitting.names = [f'T({i})' for i in selected_names]
 
 def fitting2data(y):
     """
@@ -336,7 +377,8 @@ def fitting2data(y):
     if generated_samples is True, x is assumed to have been generated from our model before
     """
     return torch.stack([t.fitting2data(yi) for yi, t in zip(y.T, data_transforms)]).T
-fitting2data.names = ['f150_scaled', 'z', 'logM', 'ha', 'hb', 'nii', 'oiii', 'D4000', 'cMag_r']
+# fitting2data.names = ['f150_scaled', 'z', 'logM', 'ha', 'hb', 'nii', 'oiii', 'D4000', 'cMag_r']
+fitting2data.names = selected_names
 
 
 def jacobian(x, y):
@@ -351,14 +393,14 @@ def data2auxillary(x):
     Adds other dimension that may be used for plotting/diagnostics etc
     Not used in the actual fit
     """
-    # return torch.tensor([[]], dtype=Xfitting.dtype).T
+    return torch.tensor([[]], dtype=Xfitting.dtype).T
     x = x.T
     return torch.stack([
         torch.log10(x[3]) - torch.log10(x[5]),  # line_scale is not needed since it's a ratio
         torch.log10(x[4]) - torch.log10(x[6]),
         # 22.5 - (2.5 * torch.log10(x[-1])),
     ]).T
-data2auxillary.names = ['log(nii / Ha)', 'log(oiii / Hb)']#, 'cmag_r']
+data2auxillary.names = []#['log(nii / Ha)', 'log(oiii / Hb)']#, 'cmag_r']
 
 
 from chainconsumer import ChainConsumer
@@ -367,6 +409,7 @@ from chainconsumer import ChainConsumer
 Xfitting = data2fitting(Xdata)  # will contain nans from fluxes
 Xerrfitting = error_transform.data2fitting(Xdata, Xerr)
 np.testing.assert_allclose(fitting2data(Xfitting), Xdata, rtol=0.07)
+np.testing.assert_allclose(error_transform.fitting2data(fitting2data(Xfitting), Xerrfitting), Xerr, rtol=0.007)
 
 class DeconvGaussianTransformed(Distribution):
     """
@@ -379,6 +422,10 @@ class DeconvGaussianTransformed(Distribution):
     def __init__(self, use_diag_errs) -> None:
         super().__init__()
         self.use_diag_errs = use_diag_errs
+        if 'f150' in fitting2data.names[0]:
+            print('subtracting noise from radio flux')
+        else:
+            print('NOT doing radio flux noise subtraction')
 
     def convolve_noise(self, observed, observed_err_tril, intrinsic):
         """
@@ -387,33 +434,36 @@ class DeconvGaussianTransformed(Distribution):
         intrinsic: the "true" values generated by the model
         returns: P(data|intrinsic,data_err) == p(w|v)
         """
-        logps = []
-        for mu, sigma, alpha in zip(random_xdgmm.mu, random_xdgmm.V, random_xdgmm.alpha):
-            mu = torch.as_tensor(mu)
-            sigma = torch.as_tensor(sigma)
-            if self.use_diag_errs:
-                err = torch.sqrt(observed_err_tril[:, 0]**2. + sigma[0, 0])
-            else:
-                err = torch.sqrt(observed_err_tril[:, 0, 0] + sigma[0, 0])
-            flux_logp = Normal(loc=mu+intrinsic[:, 0], scale=err).log_prob(observed[:, 0])
-            logps.append(flux_logp + torch.log(torch.as_tensor(alpha, dtype=err.dtype)))
-        flux_logp = torch.logsumexp(torch.stack(logps), dim=0)
+        if 'f150' in fitting2data.names[0]:
+            logps = []
+            for mu, sigma, alpha in zip(random_xdgmm.mu, random_xdgmm.V, random_xdgmm.alpha):
+                mu = torch.as_tensor(mu)
+                sigma = torch.as_tensor(sigma)
+                if self.use_diag_errs:
+                    err = torch.sqrt(observed_err_tril[:, 0]**2. + sigma[0, 0])
+                else:
+                    err = torch.sqrt(observed_err_tril[:, 0, 0] + sigma[0, 0])
+                flux_logp = Normal(loc=mu+intrinsic[:, 0], scale=err).log_prob(observed[:, 0])
+                logps.append(flux_logp + torch.log(torch.as_tensor(alpha, dtype=err.dtype)))
+            flux_logp = torch.logsumexp(torch.stack(logps), dim=0)
+        else:
+            flux_logp = 0.
         other_logps = []
         if self.use_diag_errs:
-            for i in range(1, observed.shape[1]):
+            for i in range('f150' in fitting2data.names[0], observed.shape[1]):
                 other_logps.append(Normal(loc=intrinsic[:, i], scale=observed_err_tril[:, i]).log_prob(observed[:, i]))
             return flux_logp + sum(other_logps)
         return LocDifferentiableMultivariateNormal(loc=intrinsic, scale_tril=observed_err_tril).log_prob(observed)
 
     def log_prob(self, inputs, context):
-        Z, noise_l = inputs  # data space
+        Z, noise_l = inputs  # fitting space
         X = fitting2data(Z)
         if self.use_diag_errs:
             noise_l = error_transform.fitting2data(X, noise_l)
         context_dataspace = fitting2data(context)
-        jac, is_diag = jacobian(context_dataspace, context)
+        jac, is_diag = jacobian(context_dataspace, context)  # jacobian of the data->fitting transform
         if is_diag:
-            log_scaling = torch.log(jac).sum(axis=1)
+            log_scaling = torch.log(torch.abs(jac)).sum(axis=1)
         else:
             log_scaling = torch.slogdet(jac)[1]
         context_dataspace = torch.where(torch.isfinite(context_dataspace), context_dataspace,
@@ -422,7 +472,7 @@ class DeconvGaussianTransformed(Distribution):
         log_scaling = torch.where(torch.isfinite(log_scaling), log_scaling,
                                           torch.scalar_tensor(torch.finfo(log_scaling.dtype).min,
                                                               dtype=log_scaling.dtype))
-        return self.convolve_noise(X, noise_l, context_dataspace) + log_scaling
+        return self.convolve_noise(X, noise_l, context_dataspace) - log_scaling
 
 
 class MySVIFlow(SVIFlow):
@@ -572,8 +622,7 @@ class MyChainConsumer(ChainConsumer):
 
 def plot_samples(chains, record_df=None, c=None,
                  parameters=None, log_scales=None, perc=(0.0001, 99.),
-                 log_densities=False,
-                 focus=None):
+                 log_densities=False):
     if c is None:
         c = MyChainConsumer()
     else:
@@ -596,6 +645,11 @@ def plot_samples(chains, record_df=None, c=None,
     zipped_chains = zip(*[i.T for i in chains.values()])
     extents = np.array([[np.nanpercentile(i[np.isfinite(i)], perc) for i in z] for z in zipped_chains])
     extents = [(np.min(z), np.max(z)) for z in extents]
+    if parameters is None:
+        parameters = names
+    invalid_names = [n for n in parameters if n not in names]
+    if invalid_names:
+        raise KeyError(f"Names {invalid_names} are not known, available parameters are {names}")
     for name, chain in chains.items():
         filt = reduce(lambda a, b: a & b, ((o > l) & (o < u) for o, (l, u) in zip(chain.T, extents)))
         c.add_chain(chain[filt],
@@ -605,12 +659,13 @@ def plot_samples(chains, record_df=None, c=None,
     c.configure(usetex=False, smooth=0, cloud=True, shade_alpha=0.15, logged=log_densities)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
-        c.plotter.plot(parameters=parameters, log_scales=log_scales)
+        c.plotter.plot(parameters=[n for n in names if n in parameters], log_scales=log_scales)
     if not hasattr(c, 'axins_losses') and record_df is not None:
-        c.axins_losses = c.plotter.fig_data[0].add_axes([0.5, 0.6, 0.4, 0.3])
         # axes = [ax.get_position() for ax in c.plotter.fig_data[1][0] if not ax.get_frame_on()]
-        # if np.size(c.plotter.fig_data[1]) == 1:
-        #     c.axins_losses = c.plotter.fig_data[0].add_axes([0.2, 0.6, 0.3, 0.3])
+        if np.size(c.plotter.fig_data[1]) == 4:
+            c.axins_losses = c.plotter.fig_data[0].add_axes([0.75, 0.75, 0.2, 0.2])
+        else:
+            c.axins_losses = c.plotter.fig_data[0].add_axes([0.5, 0.6, 0.4, 0.3])
         # elif np.size(c.plotter.fig_data[1]) == 2:
         #     c.axins_losses = c.plotter.fig_data[0].add_axes(axes[0])
         # else:
@@ -629,26 +684,54 @@ def plot_samples(chains, record_df=None, c=None,
             c.axins_losses_twin.plot(range(len(record_df)), record_df['val'], 'r-', label='val')
             c.axins_losses.set_xlim(max([0, max(record_df['epoch']) - 20]), max(record_df['epoch']))
         autoscale_y(c.axins_losses)
-        autoscale_y(c.axins_losses_twin)
-        c.axins_losses.legend(loc='lower right')
+        try:
+            autoscale_y(c.axins_losses_twin)
+        except ValueError:
+            pass
+        # c.axins_losses.legend(loc='lower right')
         plt.suptitle(f'epoch {len(record_df)}')
     return c
 
+
+def save_epoch_to_disk(record_df, i, _svi, train_loss, val_loss, logl, kl):
+    torch.save(_svi.model.state_dict(), params_dir / f'{i}.pt')
+    torch.save(_svi.scheduler.state_dict(), params_dir / f'{i}.opt')
+    torch.save(_svi.optimiser.state_dict(), params_dir / f'{i}.spt')
+    record_df = record_df.append(
+        {'epoch': i, 'train': train_loss, 'val': val_loss, 'logl': logl, 'kl': kl},
+        ignore_index=True
+    )
+    record_df.to_csv(directory / f'record.csv')
+    return record_df
+
+def load_epoch_from_disk(i, _svi):
+    _svi.model.load_state_dict(torch.load(params_dir / f'{i}.pt'))
+    _svi.scheduler.load_state_dict(torch.load(params_dir / f'{i}.spt'))
+    _svi.optimiser.load_state_dict(torch.load(params_dir / f'{i}.opt'))
+    df = pd.read_csv(directory / f'record.csv').iloc[:i]
+    return df
+
+
 S = cov
-partition = 10
+partition = 0
+limit = 5_000
 # TODO: errors should be normalised as well!
 # TODO: bound our model > 0 - done
 # TODO: do this in the prior/posterior flow definitions after the transforms - done
-X_test = Xfitting[:Xfitting.shape[0] // partition]
-S_test = Xerrfitting[:Xerrfitting.shape[0] // partition]
-X_train = Xfitting[Xfitting.shape[0] // partition:]
-S_train = Xerrfitting[Xerrfitting.shape[0] // partition:]
-print(f"validation={len(X_test)}, training={len(X_train)} ({1 / partition:.2%})")
+if partition == 0:
+    train_data = DeconvDataset(Xfitting[:limit], Xerrfitting[:limit], diag=True)
+    test_data = None
+else:
+    split_n = min([Xfitting.shape[0], limit]) // partition
+    X_test = Xfitting[:split_n]
+    S_test = Xerrfitting[:split_n]
+    X_train = Xfitting[split_n:][:limit-split_n]
+    S_train = Xerrfitting[split_n:][:limit-split_n]
+    print(f"validation={len(X_test)}, training={len(X_train)} ({1 / partition:.2%})")
+    train_data = DeconvDataset(X_train, S_train, diag=True)
+    test_data = DeconvDataset(X_test, S_test, diag=True)
 
-train_data = DeconvDataset(X_train[:5000], S_train[:5000], diag=True)
-test_data = DeconvDataset(X_test, S_test, diag=True)
-
-directory = Path('models/noisy-all-uncut-trial2')
+directory = Path('models/noisy-all-uncut-R-mass')
 space_dir = directory / 'plots'
 params_dir = directory / 'params'
 directory.mkdir(parents=True, exist_ok=True)
@@ -656,36 +739,34 @@ space_dir.mkdir(parents=True, exist_ok=True)
 params_dir.mkdir(parents=True, exist_ok=True)
 print(f'saving to {directory}')
 
-total_epochs = 10_000
-start_from = 76
+total_epochs = 1000
+start_from = 0
 svi = MySVIFlow(
     Xdata.shape[1],
-    flow_steps=5,
+    flow_steps=4,
     device= torch.device('cpu'),
     batch_size=2000,
     epochs=total_epochs,
-    lr=1e-4,
+    lr=1e-3,
     n_samples=100,
-    grad_clip_norm=1,
-    positive_dims=[0],
+    # grad_clip_norm=1,
+    # bounds=data2fitting(torch.as_tensor(np.asarray(model_bounds).T)).T.numpy(),
     kl_multiplier=1.,
     scheduler_kwargs={},  # add overrides here
     use_iwae=True,
-    use_diag_errs=True
+    use_diag_errs=True,
 )
 prior_samples = svi.model._prior.sample(10_000)
 post_samples = svi.model._approximate_posterior.sample(10_000)
 if start_from > 0:
-    svi.model.load_state_dict(torch.load(params_dir / f'{start_from}.pt'))
-    df = pd.read_csv(directory / f'record.csv')
-    svi.epochs -= start_from
+    df = load_epoch_from_disk(start_from, svi)
 else:
     df = pd.DataFrame({'train': [], 'val': [], 'logl': [], 'kl': []})
 
 def iterator():
     for i in enumerate(svi.iter_fit(train_data, test_data, seed=SEED, num_workers=8,
                                     rewind_on_inf=True, return_kl_logl=True,
-                                    ), start_from):  # iterator
+                                    start_from=start_from), start_from):  # iterator
         yield i
 
 
@@ -720,14 +801,6 @@ def autoscale_y(ax,margin=0.05):
 
     ax.set_ylim(bot,top)
 
-def save_epoch_to_disk(record_df, i, _svi, train_loss, val_loss, logl, kl):
-    torch.save(_svi.model.state_dict(), params_dir / f'{i}.pt')
-    record_df = record_df.append(
-        {'epoch': i, 'train': train_loss, 'val': val_loss, 'logl': logl, 'kl': kl},
-        ignore_index=True
-    )
-    record_df.to_csv(directory / f'record.csv')
-    return record_df
 
 def plot_epoch(i, _svi, xfitting, record_df=None, chainconsumer=None, parameters=None,
                log_scales=None, perc=(0.0001, 99.), log_densities=False):

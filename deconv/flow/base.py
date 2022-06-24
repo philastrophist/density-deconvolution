@@ -6,8 +6,6 @@ import torch.utils.data as data_utils
 
 from nflows import distributions, flows, transforms
 
-from deconv.flow.transforms import PositiveOnly
-
 
 class BaseFlow(ABC):
     """ABC for flow-type density estimation."""

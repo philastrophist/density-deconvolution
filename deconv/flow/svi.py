@@ -9,14 +9,16 @@ from torch.nn.utils import clip_grad_norm_
 
 from nflows import flows, transforms, utils
 from nflows.distributions import ConditionalDiagonalNormal, StandardNormal
+from torch.optim.lr_scheduler import ChainedScheduler, LambdaLR
 from tqdm import tqdm
 
 from .distributions import DeconvGaussian
 from .maf import MAFlow
 from .nn import DeconvInputEncoder
-from .transforms import PositiveOnly
+from .transforms import SigmoidBound
 from .vae import VariationalAutoencoder
 from ..utils.sampling import minibatch_sample
+from warmup_scheduler import GradualWarmupScheduler
 
 
 def seed_worker(worker_id):
@@ -42,11 +44,16 @@ class SVIFlow(MAFlow):
 
     def __init__(self, dimensions, flow_steps, lr, epochs, context_size=64, hidden_features=128,
                  batch_size=256, kl_warmup=0.2, kl_init_factor=0.5, kl_multiplier=4.,
-                 positive_dims: List[int] = None, positive_scalings=None,
+                 bounds=None,
                  n_samples=50, grad_clip_norm=None, use_iwae=False, use_diag_errs=False,
                  scheduler_kwargs=None, device=None):
-        self.positive_dims = positive_dims
-        self.positive_scalings = positive_scalings
+        self.bounds = bounds
+        self.bound = None
+        if bounds is not None:
+            bounds = np.asarray(self.bounds)
+            width = bounds[:, 1] - bounds[:, 0]
+            lower99, upper99 = bounds[:, 0] + (width * 0.999), bounds[:, 1] - (width * 0.999)
+            self.bound = SigmoidBound(bounds[:, 0], bounds[:, 1], lower99, upper99)
         self.use_diag_errs = use_diag_errs
         super().__init__(
             dimensions, flow_steps, lr, epochs, batch_size, device
@@ -70,11 +77,13 @@ class SVIFlow(MAFlow):
         )
 
         self.model.to(self.device)
+        self.optimiser = None
+        self.scheduler = None
 
     def _create_prior(self):
         self.transform = self._create_transform(context_features=None, hidden_features=self.hidden_features)
-        if self.positive_dims:
-            self.transform = CompositeTransform([PositiveOnly(self.positive_dims, self.positive_scalings), self.transform])
+        if self.bound is not None:
+            self.transform = CompositeTransform([self.bound, self.transform])
         distribution = StandardNormal((self.dimensions,))
         return HandleInfFlow(
             self.transform,
@@ -94,8 +103,8 @@ class SVIFlow(MAFlow):
 
         posterior_transform = self._create_transform(self.context_size, hidden_features=self.hidden_features)
         inv = transforms.InverseTransform(posterior_transform)
-        if self.positive_dims:
-            posterior_transform = CompositeTransform([PositiveOnly(self.positive_dims, self.positive_scalings), inv])
+        if self.bound is not None:
+            posterior_transform = CompositeTransform([self.bound, inv])
         else:
             posterior_transform = inv
         return HandleInfFlow(posterior_transform, distribution)
@@ -138,11 +147,15 @@ class SVIFlow(MAFlow):
         scheduler._last_lr = [group['lr'] for group in scheduler.optimizer.param_groups]
 
     def iter_fit(self, data, val_data=None, show_bar=True, seed=None, use_cuda=False, num_workers=4,
-                 rewind_on_inf=False, return_kl_logl=False):
-        optimiser = torch.optim.Adam(
-            params=self.model.parameters(),
-            lr=self.lr
-        )
+                 rewind_on_inf=False, return_kl_logl=False, start_from=0):
+        if self.optimiser is None:
+            optimiser = torch.optim.Adam(
+                params=self.model.parameters(),
+                lr=self.lr
+            )
+            self.optimiser = optimiser
+        else:
+            optimiser = self.optimiser
         g, worker_init_fn = None, None
         if seed is not None:
             g = torch.Generator()
@@ -165,8 +178,13 @@ class SVIFlow(MAFlow):
                                 threshold=1e-4)
         scheduler_kwargs = {} if self.scheduler_kwargs is None else self.scheduler_kwargs
         _scheduler_kwargs.update(scheduler_kwargs)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimiser, **_scheduler_kwargs)
-        bar = tqdm(range(self.epochs), disable=not show_bar, unit='epochs', smoothing=1)
+        if self.scheduler is None:
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimiser, **_scheduler_kwargs)
+            scheduler = GradualWarmupScheduler(optimiser, multiplier=1, total_epoch=10, after_scheduler=scheduler)
+            self.scheduler = scheduler
+        else:
+            scheduler = self.scheduler
+        bar = tqdm(range(self.epochs), initial=start_from, disable=not show_bar, unit='epochs', smoothing=1)
         train_loss = 0.0
         val_loss = 0.0
         checkpoint = self.checkpoint_fitting(optimiser, scheduler)
@@ -202,12 +220,12 @@ class SVIFlow(MAFlow):
                         )
                     torch.set_default_tensor_type(torch.FloatTensor)
 
-                    minibatch_scaling = data.X.shape[0] / d[0].shape[0]
+                    # minibatch_scaling = data.X.shape[0] / d[0].shape[0]
                     objective = torch.clamp(objective, -1e+30, 1e+30).sum()
-                    train_loss += torch.sum(objective * minibatch_scaling).item()
-                    logls += torch.sum(logl * minibatch_scaling).item()
-                    kls += torch.sum(kl * minibatch_scaling).item()
-                    loss = -1 * torch.sum(objective * minibatch_scaling)  # changed to sum with minibatch scaling rather than mean
+                    train_loss += torch.sum(objective).item()
+                    logls += torch.sum(logl).item()
+                    kls += torch.sum(kl).item()
+                    loss = -1 * torch.mean(objective)
                     loss.backward()
                     if self.grad_clip_norm is not None:
                         torch.nn.utils.clip_grad_norm_(
@@ -234,11 +252,11 @@ class SVIFlow(MAFlow):
                         num_samples=self.n_samples,
                         use_cuda=use_cuda,
                         num_workers=num_workers
-                    ) * minibatch_scaling
-                    bar.desc = f'loss[train|val], logl, kl: [{train_loss:.4f} | {val_loss:.4f}], {logls:.4f}, {kls:.4f}'
+                    ) / len(val_data)
+                    bar.desc = f'loss[train|val], logl, kl, lr: [{train_loss:.4f} | {val_loss:.4f}], {logls:.4f}, {kls:.4f} {scheduler.get_lr()[0]:.1e}'
                     scheduler.step(val_loss)
                 else:
-                    bar.desc = f'loss[train], [logl|kl]: {train_loss:.4f}, {logls:.4f} | {kls:.4f}'
+                    bar.desc = f'loss[train], [logl|kl], lr: {train_loss:.4f}, {logls:.4f} | {kls:.4f} {scheduler.get_lr()[0]:.1e}'
                     scheduler.step(train_loss)
                 if return_kl_logl:
                     yield self, train_loss, val_loss, logls, kls
