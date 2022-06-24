@@ -152,14 +152,14 @@ class Plotter:
         if not updated and self.c is not None and not force:
             return self.i, self.c.plotter.fig_data[0]
         self._reset_c_axes(self.c)
-        self.c = plot_epoch(self.i, self.svi, train_data.X, self.df, self.c, self.names)
+        self.c = plot_epoch(self.i, self.svi, train_data.X, None, self.c, self.names)
 
     def plot_epoch_q(self, test_point, test_point_err, i=None, force=False):
         updated = self.update(i)
         if not updated and self.qc is not None and not force:
             return self.i, self.qc.plotter.fig_data[0]
         self._reset_c_axes(self.qc)
-        self.qc = plot_epoch_q(self.i, self.svi, test_point, test_point_err, self.df, self.qc, self.names, n=10_000, perc=(0., 100.))
+        self.qc = plot_epoch_q(self.i, self.svi, test_point, test_point_err, None, self.qc, self.names, n=10_000, perc=(0., 100.))
 
 
 if __name__ == '__main__':

@@ -44,7 +44,7 @@ class SVIFlow(MAFlow):
 
     def __init__(self, dimensions, flow_steps, lr, epochs, context_size=64, hidden_features=128,
                  batch_size=256, kl_warmup=0.2, kl_init_factor=0.5, kl_multiplier=4.,
-                 bounds=None,
+                 bounds=None, warmup=10,
                  n_samples=50, grad_clip_norm=None, use_iwae=False, use_diag_errs=False,
                  scheduler_kwargs=None, device=None):
         self.bounds = bounds
@@ -77,8 +77,19 @@ class SVIFlow(MAFlow):
         )
 
         self.model.to(self.device)
-        self.optimiser = None
-        self.scheduler = None
+        self.optimiser = torch.optim.Adam(
+            params=self.model.parameters(),
+            lr=self.lr
+        )
+        _scheduler_kwargs = dict(factor=0.3,
+                                 patience=10,
+                                 verbose=True,
+                                 threshold=1e-4)
+        scheduler_kwargs = {} if self.scheduler_kwargs is None else self.scheduler_kwargs
+        _scheduler_kwargs.update(scheduler_kwargs)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimiser, mode='max', **_scheduler_kwargs)
+        self.scheduler = GradualWarmupScheduler(self.optimiser, multiplier=1, total_epoch=warmup, after_scheduler=scheduler)
+
 
     def _create_prior(self):
         self.transform = self._create_transform(context_features=None, hidden_features=self.hidden_features)
@@ -139,30 +150,20 @@ class SVIFlow(MAFlow):
         print(f'Epoch {epoch}: model parameters got updated to NaN or resulting in invalid loss, rolling back and slowing down')
         scheduler, optimiser, previous_state, previous_optimiser_state, previous_scheduler_state = checkpoint
         self.model.load_state_dict(previous_state)
-        optimiser.load_state_dict(previous_optimiser_state)
-        scheduler.load_state_dict(previous_scheduler_state)
-        scheduler._reduce_lr(epoch)
-        scheduler.cooldown_counter = scheduler.cooldown
-        scheduler.num_bad_epochs = 0
-        scheduler._last_lr = [group['lr'] for group in scheduler.optimizer.param_groups]
+        self.optimiser.load_state_dict(previous_optimiser_state)
+        self.scheduler.load_state_dict(previous_scheduler_state)
+        self.scheduler._reduce_lr(epoch)
+        self.scheduler.cooldown_counter = self.scheduler.cooldown
+        self.scheduler.num_bad_epochs = 0
+        self.scheduler._last_lr = [group['lr'] for group in self.scheduler.optimizer.param_groups]
 
     def iter_fit(self, data, val_data=None, show_bar=True, seed=None, use_cuda=False, num_workers=4,
                  rewind_on_inf=False, return_kl_logl=False, start_from=0):
-        if self.optimiser is None:
-            optimiser = torch.optim.Adam(
-                params=self.model.parameters(),
-                lr=self.lr
-            )
-            self.optimiser = optimiser
-        else:
-            optimiser = self.optimiser
         g, worker_init_fn = None, None
         if seed is not None:
             g = torch.Generator()
             g.manual_seed(seed)
             worker_init_fn = seed_worker
-
-
         loader = data_utils.DataLoader(
             data,
             batch_size=self.batch_size,
@@ -172,22 +173,12 @@ class SVIFlow(MAFlow):
             generator=g,
             worker_init_fn=worker_init_fn
         )
-        _scheduler_kwargs = dict(factor=0.3,
-                                patience=10,
-                                verbose=True,
-                                threshold=1e-4)
-        scheduler_kwargs = {} if self.scheduler_kwargs is None else self.scheduler_kwargs
-        _scheduler_kwargs.update(scheduler_kwargs)
-        if self.scheduler is None:
-            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimiser, **_scheduler_kwargs)
-            scheduler = GradualWarmupScheduler(optimiser, multiplier=1, total_epoch=10, after_scheduler=scheduler)
-            self.scheduler = scheduler
-        else:
-            scheduler = self.scheduler
+
         bar = tqdm(range(self.epochs), initial=start_from, disable=not show_bar, unit='epochs', smoothing=1)
         train_loss = 0.0
         val_loss = 0.0
-        checkpoint = self.checkpoint_fitting(optimiser, scheduler)
+
+        checkpoint = self.checkpoint_fitting(self.optimiser, self.scheduler)
 
         for iepoch in bar:
             try:
@@ -200,7 +191,7 @@ class SVIFlow(MAFlow):
                 for j, d in enumerate(loader):
                     d = [a.to(self.device) for a in d]
 
-                    optimiser.zero_grad()
+                    self.optimiser.zero_grad()
                     if use_cuda:
                         torch.set_default_tensor_type(torch.cuda.FloatTensor)
 
@@ -232,7 +223,7 @@ class SVIFlow(MAFlow):
                             self.model.parameters(),
                             self.grad_clip_norm
                         )
-                    optimiser.step()
+                    self.optimiser.step()
                 logls /= len(data)
                 kls /= len(data)
 
@@ -240,10 +231,10 @@ class SVIFlow(MAFlow):
                     if not rewind_on_inf:
                         raise ValueError(f"Bad loss or network parameters")
                     self.undo_step(iepoch, checkpoint)
-                    checkpoint = self.checkpoint_fitting(optimiser, scheduler)
+                    checkpoint = self.checkpoint_fitting(self.optimiser, self.scheduler)
                     continue
                 else:
-                    checkpoint = self.checkpoint_fitting(optimiser, scheduler)
+                    checkpoint = self.checkpoint_fitting(self.optimiser, self.scheduler)
                 val_loss = None
                 if val_data:
                     val_loss = self.score_batch(
@@ -253,11 +244,11 @@ class SVIFlow(MAFlow):
                         use_cuda=use_cuda,
                         num_workers=num_workers
                     ) / len(val_data)
-                    bar.desc = f'loss[train|val], logl, kl, lr: [{train_loss:.4f} | {val_loss:.4f}], {logls:.4f}, {kls:.4f} {scheduler.get_lr()[0]:.1e}'
-                    scheduler.step(val_loss)
+                    bar.desc = f'loss[train|val], logl, kl, lr: [{train_loss:.4f} | {val_loss:.4f}], {logls:.4f}, {kls:.4f}'
+                    self.scheduler.step(epoch=iepoch, metrics=val_loss)
                 else:
-                    bar.desc = f'loss[train], [logl|kl], lr: {train_loss:.4f}, {logls:.4f} | {kls:.4f} {scheduler.get_lr()[0]:.1e}'
-                    scheduler.step(train_loss)
+                    bar.desc = f'loss[train], [logl|kl], lr: {train_loss:.4f}, {logls:.4f} | {kls:.4f}'
+                    self.scheduler.step(epoch=iepoch, metrics=train_loss)
                 if return_kl_logl:
                     yield self, train_loss, val_loss, logls, kls
                 else:
