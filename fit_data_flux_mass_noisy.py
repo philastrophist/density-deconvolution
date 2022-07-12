@@ -162,7 +162,12 @@ overlapped['lgm_tot_p50_err'] = (overlapped['lgm_tot_p84'] - overlapped['lgm_tot
 set_large_uncertainty(overlapped, 'lgm_tot_p50', 'lgm_tot_p50_err')
 set_large_uncertainty(overlapped, 'cModelFlux_r', 'cModelFluxIvar_r', ivar=True)
 
-radio_flux_scaling = 100.
+lumdist = Planck18.luminosity_distance(overlapped['redshift'])
+distmod = Planck18.distmod(overlapped['redshift']).value
+overlapped['cModelMag_r'] = 22.5 - 2.5 * np.log10(overlapped['cModelFlux_r'])  - distmod
+overlapped['cModelMagErr_r'] = np.abs(2.5 * 0.434 / np.sqrt(overlapped['cModelFluxIvar_r']) / overlapped['cModelFlux_r'])
+
+radio_flux_scaling = 1000.
 
 Xdata = torch.tensor(np.stack([
     overlapped[data_flux_name] * radio_flux_scaling,
@@ -352,7 +357,7 @@ model_bounds = [
 
 data_transforms = [radio_flux_transform, redshift_transform, mass_transform] + line_transforms + [d4000_transform, rflux_transform]
 
-selected_names = ['z', 'logM', 'ha', 'hb', 'nii', 'oiii', 'D4000', 'R']
+selected_names = ['f150', 'logM', 'ha', 'hb', 'nii', 'oiii', 'D4000', 'R']
 indexes = [varnames.index(i) for i in selected_names]
 
 Xdata = Xdata[:, indexes]
@@ -443,6 +448,7 @@ class DeconvGaussianTransformed(Distribution):
                 if self.use_diag_errs:
                     err = torch.sqrt(observed_err_tril[:, f150_index]**2. + sigma[0, 0])
                 else:
+                    raise NotImplementedError(f"Wrong")
                     err = torch.sqrt(observed_err_tril[:, f150_index, f150_index] + sigma[0, 0])
                 flux_logp = Normal(loc=mu+intrinsic[:, f150_index], scale=err).log_prob(observed[:, f150_index])
                 logps.append(flux_logp + torch.log(torch.as_tensor(alpha, dtype=err.dtype)))
@@ -730,7 +736,8 @@ else:
     train_data = DeconvDataset(X_train, S_train, diag=True)
     test_data = DeconvDataset(X_test, S_test, diag=True)
 
-directory = Path('models/noisy-all-uncut-all-expect-f150')
+# directory = Path('models/noisy-all-uncut-all-expect-f150')
+directory = Path('models/noisy-all-uncut-all-expect-f150-without-redshift')
 space_dir = directory / 'plots'
 params_dir = directory / 'params'
 directory.mkdir(parents=True, exist_ok=True)

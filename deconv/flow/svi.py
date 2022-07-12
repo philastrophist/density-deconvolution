@@ -51,9 +51,7 @@ class SVIFlow(MAFlow):
         self.bound = None
         if bounds is not None:
             bounds = np.asarray(self.bounds)
-            width = bounds[:, 1] - bounds[:, 0]
-            lower99, upper99 = bounds[:, 0] + (width * 0.999), bounds[:, 1] - (width * 0.999)
-            self.bound = SigmoidBound(bounds[:, 0], bounds[:, 1], lower99, upper99)
+            self.bound = SigmoidBound(bounds[:, 0], bounds[:, 1])
         self.use_diag_errs = use_diag_errs
         super().__init__(
             dimensions, flow_steps, lr, epochs, batch_size, device
