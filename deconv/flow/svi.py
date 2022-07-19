@@ -4,7 +4,7 @@ from typing import List
 import numpy as np
 import torch
 import torch.utils.data as data_utils
-from nflows.transforms import CompositeTransform
+from nflows.transforms import CompositeTransform, InverseTransform
 from torch.nn.utils import clip_grad_norm_
 
 from nflows import flows, transforms, utils
@@ -15,7 +15,7 @@ from tqdm import tqdm
 from .distributions import DeconvGaussian
 from .maf import MAFlow
 from .nn import DeconvInputEncoder
-from .transforms import SigmoidBound
+from .transforms import CompositeBound, Sigmoid, BoundSpace
 from .vae import VariationalAutoencoder
 from ..utils.sampling import minibatch_sample
 from warmup_scheduler import GradualWarmupScheduler
@@ -44,14 +44,14 @@ class SVIFlow(MAFlow):
 
     def __init__(self, dimensions, flow_steps, lr, epochs, context_size=64, hidden_features=128,
                  batch_size=256, kl_warmup=0.2, kl_init_factor=0.5, kl_multiplier=4.,
-                 bounds=None, warmup=10,
+                 bounds=None, eps=1e-6, warmup=10,
                  n_samples=50, grad_clip_norm=None, use_iwae=False, use_diag_errs=False,
                  scheduler_kwargs=None, device=None):
         self.bounds = bounds
         self.bound = None
         if bounds is not None:
-            bounds = np.asarray(self.bounds)
-            self.bound = SigmoidBound(bounds[:, 0], bounds[:, 1])
+            bounds = torch.as_tensor(self.bounds)
+            self.bound = BoundSpace(bounds.min(dim=1).values, bounds.max(dim=1).values, 1e-6)
         self.use_diag_errs = use_diag_errs
         super().__init__(
             dimensions, flow_steps, lr, epochs, batch_size, device
@@ -92,7 +92,7 @@ class SVIFlow(MAFlow):
     def _create_prior(self):
         self.transform = self._create_transform(context_features=None, hidden_features=self.hidden_features)
         if self.bound is not None:
-            self.transform = CompositeTransform([self.bound, self.transform])
+            self.transform = CompositeTransform([InverseTransform(self.bound), self.transform])  # turn inputs into noise
         distribution = StandardNormal((self.dimensions,))
         return HandleInfFlow(
             self.transform,
@@ -113,7 +113,7 @@ class SVIFlow(MAFlow):
         posterior_transform = self._create_transform(self.context_size, hidden_features=self.hidden_features)
         inv = transforms.InverseTransform(posterior_transform)
         if self.bound is not None:
-            posterior_transform = CompositeTransform([self.bound, inv])
+            posterior_transform = CompositeTransform([InverseTransform(self.bound), inv])
         else:
             posterior_transform = inv
         return HandleInfFlow(posterior_transform, distribution)

@@ -344,24 +344,22 @@ line_transforms = [make_data_transform(Xdata[:, i],
 d4000_transform = make_data_transform(Xdata[:, 7])
 rflux_transform = make_data_transform(Xdata[:, 8])
 
-model_bounds = [
-    [0, 500],
-    [0.02, 0.09],
-    [2, 15],
+model_bounds = np.array([
+    [0, np.inf],
+    [0.05, 0.085],
+    [-np.inf, np.inf],
 ] + \
-    [[-10_000, 10_000]]*4 \
-+ [
-    [0, 10],
-    [0, 20],
-]
+    [[-np.inf, np.inf]]*6
+)
 
 data_transforms = [radio_flux_transform, redshift_transform, mass_transform] + line_transforms + [d4000_transform, rflux_transform]
 
-selected_names = ['f150', 'logM', 'ha', 'hb', 'nii', 'oiii', 'D4000', 'R']
+selected_names = ['z', 'logM', 'D4000']
 indexes = [varnames.index(i) for i in selected_names]
 
 Xdata = Xdata[:, indexes]
 Xerr = Xerr[:, indexes]
+bounds = model_bounds[indexes]
 data_transforms = [data_transforms[i] for i in indexes]
 error_transform = make_uncertainty_transform(Xdata, Xerr)
 
@@ -757,7 +755,7 @@ svi = MySVIFlow(
     warmup=10,
     n_samples=25,
     grad_clip_norm=100,
-    # bounds=data2fitting(torch.as_tensor(np.asarray(model_bounds).T)).T.numpy(),
+    bounds=data2fitting(torch.as_tensor(bounds, dtype=Xdata.dtype).T).T,
     kl_multiplier=1.,
     scheduler_kwargs={'patience': 20},  # add overrides here
     use_iwae=True,

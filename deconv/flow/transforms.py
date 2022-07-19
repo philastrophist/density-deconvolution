@@ -1,56 +1,64 @@
 from typing import List
 
 import torch
-from nflows.transforms import Transform, Sigmoid, InputOutsideDomain, CompositeTransform
+from nflows.transforms import Transform, Sigmoid, InputOutsideDomain, CompositeTransform, InverseTransform
 from nflows.utils import torchutils
 from torch.nn import functional as F
 import numpy as np
 
-class LowerBound(Transform):
+class BatchedTransform(Transform):
+    def inverse(self, inputs, context=None):
+        x, logabsdet = self._inverse(inputs, context)
+        return x, torch.sum(logabsdet, dim=-1)
+
+    def forward(self, inputs, context=None):
+        x, logabsdet = self._forward(inputs, context)
+        return x, torch.sum(logabsdet, dim=-1)
+
+
+class LowerBound(BatchedTransform):
     def __init__(self, lower, eps=1e-6) -> None:
         super().__init__()
         self.lower = lower
         self.eps = eps
 
-    def inverse(self, inputs, context=None):
+    def _inverse(self, inputs, context=None):
         """
         from [l, +oo] -> [1, 0]
         """
-        y = inputs - self.lower
-        outputs = y / (1 + y)
-        return torch.clamp(outputs, self.eps, 1-self.eps), -2 * torch.log(1 + y)
+        y = torch.exp(self.lower - inputs)
+        return torch.clamp(y, self.eps, 1-self.eps), self.lower - inputs # |dy/dx| = e^(l-x)
 
-    def forward(self, inputs, context=None):
+    def _forward(self, inputs, context=None):
         """
         from [1, 0] -> [l, +oo]
         """
-        x = inputs / (1 - inputs)
-        return x + self.lower, -2 * torch.log(1 - inputs)
+        x = -torch.log(inputs)
+        return self.lower + x, x  # |d/dx| is -log(|inputs|) but inputs is always positive, so simplify
 
 
-class UpperBound(Transform):
+class UpperBound(BatchedTransform):
     def __init__(self, upper, eps=1e-6) -> None:
         super().__init__()
         self.upper = upper
         self.eps = eps
 
-    def inverse(self, inputs, context=None):
+    def _inverse(self, inputs, context=None):
         """
         from [-oo, u] -> [0, 1]
         """
-        y = self.upper - inputs
-        outputs = y / (1 + y)
-        return torch.clamp(outputs, self.eps, 1-self.eps), -2 * torch.log(1 + y)
+        x = torch.exp(inputs - self.upper)
+        return torch.clamp(x, self.eps, 1-self.eps), inputs - self.upper
 
-    def forward(self, inputs, context=None):
+    def _forward(self, inputs, context=None):
         """
         from [0, 1] -> [-oo, u]
         """
-        x = inputs / (1 - inputs)
-        return self.upper - x, -2 * torch.log(1 - inputs)
+        y = torch.log(inputs)
+        return y + self.upper, -y
 
 
-class TwoSidedBound(Transform):
+class TwoSidedBound(BatchedTransform):
     def __init__(self, lower, upper, eps=1e-6):
         super(TwoSidedBound, self).__init__()
         self.lower = lower
@@ -62,16 +70,16 @@ class TwoSidedBound(Transform):
         except TypeError:
             self.logscale = torch.log(self.scale)
 
-    def inverse(self, inputs, context=None):
+    def _inverse(self, inputs, context=None):
         """
-        from [-oo, +oo] -> [0, 1]
+        from [l, u] -> [0, 1]
         """
         outputs = torch.clamp((inputs - self.lower) / self.scale, self.eps, 1 - self.eps)
         return outputs, -self.logscale
 
-    def forward(self, inputs, context=None):
+    def _forward(self, inputs, context=None):
         """
-        from [0, 1] -> [-oo, +oo]
+        from [0, 1] -> [l, u]
         """
         outputs = (inputs * self.scale) + self.lower
         return outputs, self.logscale
@@ -80,34 +88,96 @@ class TwoSidedBound(Transform):
 class CompositeBound(Transform):
     def __init__(self, lower, upper, eps=1e-6) -> None:
         super().__init__()
-        self.lower = lower
-        self.upper = upper
-        self.scale = upper - lower
+        self.lower = torch.as_tensor(lower)
+        self.upper = torch.as_tensor(upper)
+        self.scale = self.upper - self.lower
         self.eps = eps
-        self.is_lower_only = torch.isfinite(self.upper) & ~torch.isfinite(self.lower)
-        self.is_upper_only = ~torch.isfinite(self.upper) & torch.isfinite(self.lower)
+        self.is_lower_only = ~torch.isfinite(self.upper) & torch.isfinite(self.lower)
+        self.is_upper_only = torch.isfinite(self.upper) & ~torch.isfinite(self.lower)
         self.is_both = torch.isfinite(self.upper) & torch.isfinite(self.lower)
-        if torch.any((torch.log10(self.scale) >= -np.log10(self.eps) / 2) & ~self.is_both).numpy():
-            raise RuntimeError(f"Cannot use two-sided bounds which have a larger width than the eps precision")
-        self.lower_only = LowerBound(self.lower)
-        self.upper_only = UpperBound(self.upper)
-        self.both = TwoSidedBound(self.lower, self.upper, eps)
+        self.lower_only = LowerBound(self.lower[self.is_lower_only])
+        self.upper_only = UpperBound(self.upper[self.is_upper_only])
+        self.both = TwoSidedBound(self.lower[self.is_both], self.upper[self.is_both], eps)
+
+    def _transform_template(self, which, inputs, context):
+        lower = getattr(self.lower_only, which)(inputs[:, self.is_lower_only], context)
+        upper = getattr(self.upper_only, which)(inputs[:, self.is_upper_only], context)
+        both = getattr(self.both, which)(inputs[:, self.is_both], context)
+        outputs, logabsdet = inputs.clone(), torch.zeros(inputs.shape[0], dtype=inputs.dtype)
+        outputs[:, self.is_lower_only] = lower[0]
+        outputs[:, self.is_upper_only] = upper[0]
+        outputs[:, self.is_both] = both[0]
+        logabsdet = lower[1] + upper[1] + both[1]  # we dont need to sum here since torch.sum used above expands into a n-sized tensor
+        return outputs, logabsdet
 
     def inverse(self, inputs, context=None):
-        lower = self.lower_only.inverse(inputs, context)
-        upper = self.upper_only.inverse(inputs, context)
-        both = self.both.inverse(inputs, context)
-        outputs = torch.where(self.is_both, both[0], torch.where(self.is_lower_only, lower[0], upper[0]))
-        logabsdet = torch.where(self.is_both, both[1], torch.where(self.is_lower_only, lower[1], upper[1]))
-        return outputs, logabsdet
+        return self._transform_template('inverse', inputs, context)
 
     def forward(self, inputs, context=None):
-        lower = self.lower_only.forward(inputs, context)
-        upper = self.upper_only.forward(inputs, context)
-        both = self.both.forward(inputs, context)
-        outputs = torch.where(self.is_both, both[0], torch.where(self.is_lower_only, lower[0], upper[0]))
-        logabsdet = torch.where(self.is_both, both[1], torch.where(self.is_lower_only, lower[1], upper[1]))
-        return outputs, logabsdet
+        return self._transform_template('forward', inputs, context)
+
+#
+# class SkipSigmoid(Sigmoid):
+#     def __init__(self, skip_dims, temperature=1, eps=1e-6, learn_temperature=False):
+#         """
+#         A sigmoid, but the skip_dims boolean mask tells it not to transform the given dimension at all
+#         """
+#         super().__init__(temperature, eps, learn_temperature)
+#         self.skip_dims = skip_dims
+#
+#     def _forward(self, inputs, context=None):
+#         inputs = self.temperature * inputs
+#         outputs = torch.sigmoid(inputs)
+#         logabsdet = torch.log(self.temperature) - F.softplus(-inputs) - F.softplus(inputs)
+#         return outputs, logabsdet
+#
+#     def _inverse(self, inputs, context=None):
+#         if torch.min(inputs[:, ~self.skip_dims]) < 0 or torch.max(inputs[:, ~self.skip_dims]) > 1:
+#             raise InputOutsideDomain()
+#
+#         inputs = torch.clamp(inputs, self.eps, 1 - self.eps)
+#
+#         outputs = (1 / self.temperature) * (torch.log(inputs) - torch.log1p(-inputs))
+#         logabsdet = torch.log(self.temperature) - F.softplus(-self.temperature * outputs) - F.softplus(self.temperature * outputs)
+#         return outputs, -logabsdet
+#
+#     def forward(self, inputs, context=None):
+#         x, logabsdet = self._forward(inputs[:, ~self.skip_dims], context)
+#         result = inputs.clone()
+#         result[:, ~self.skip_dims] = x  # no need to do this for logabsdet since we sum and it would be 0
+#         return result, torchutils.sum_except_batch(logabsdet)
+#
+#     def inverse(self, inputs, context=None):
+#         x, logabsdet = self._inverse(inputs[:, ~self.skip_dims], context)
+#         result = inputs.clone()
+#         result[:, ~self.skip_dims] = x  # no need to do this for logabsdet since we sum and it would be 0
+#         return result, torchutils.sum_except_batch(logabsdet)
+
+
+class BoundSpace(CompositeTransform):
+    def __init__(self, lower_bounds, upper_bounds, eps):
+        self.lower_bounds = lower_bounds
+        self.upper_bounds = upper_bounds
+        self.skip_dims = ~(torch.isfinite(self.lower_bounds) | torch.isfinite(self.upper_bounds))
+        self.skip_all = bool(torch.all(self.skip_dims).numpy())
+        super().__init__([Sigmoid(eps=eps), CompositeBound(self.lower_bounds[~self.skip_dims], self.upper_bounds[~self.skip_dims], eps)])
+
+    def forward(self, inputs, context=None):
+        if self.skip_all:
+            return inputs, torch.zeros(inputs.shape[0], dtype=inputs.dtype)
+        x, logabsdet = super().forward(inputs[:, ~self.skip_dims], context)
+        result = inputs.clone()
+        result[:, ~self.skip_dims] = x  # no need to do this for logabsdet since we sum and it would be 0
+        return result, logabsdet
+
+    def inverse(self, inputs, context=None):
+        if self.skip_all:
+            return inputs, torch.zeros(inputs.shape[0], dtype=inputs.dtype)
+        x, logabsdet = super().inverse(inputs[:, ~self.skip_dims], context)
+        result = inputs.clone()
+        result[:, ~self.skip_dims] = x  # no need to do this for logabsdet since we sum and it would be 0
+        return result, logabsdet
+
 
 # class SigmoidBound(Sigmoid):
 #     def __init__(self, lower, upper, eps=1e-6):
@@ -143,22 +213,35 @@ class CompositeBound(Transform):
 #         outputs = (1 / self.temperature) * (torch.log(inputs) - torch.log1p(-inputs))
 #         logabsdets = torch.log(self.temperature) - F.softplus(-self.temperature * outputs) - F.softplus(self.temperature * outputs)
 #         logabsdets += self.logscale
-#         return outputs, -torchutils.sum_except_batch(logabsdets)
-
 if __name__ == '__main__':
     # transforms for
     # [-oo, +oo] -> [-oo, u]
     # [-oo, +oo] -> [l, +oo]
     # [-oo, +oo] -> [l, u]
-
+    import numpy as np
+    import matplotlib.pyplot as plt
     eps = 1e-6
-    bounds = torch.tensor([
-        [0, 1e+1],
-        [-0.1, 1e+6]
-    ])
-    bound = CompositeTransform([Sigmoid(eps=eps), CompositeBound(bounds[:, 0], bounds[:, 1], eps)])
+    lower_bounds = np.array([-np.inf, 0])
+    upper_bounds = np.array([10., 10000.])
 
+    bound = BoundSpace(lower_bounds, upper_bounds, eps)
+    # bound = SkipSigmoid(torch.tensor([False, True]))
+    # bound = CompositeTransform([Sigmoid(eps=eps), CompositeBound(lower_bounds, upper_bounds, eps)])
 
-    Xdata = torch.tensor([[0.001, 0.], [0, 1], [1., 2.]])
-    print(bound.forward(bound.inverse(Xdata)[0])[0].numpy())
-    # print(bound.inverse(Xdata)[0].numpy())
+    fig, axs = plt.subplots(2)
+    Xdata = np.random.normal(0, 2, (1000, 2))
+    Ydata = bound.forward(torch.as_tensor(Xdata))[0]
+    Xdata_ = bound.inverse(Ydata)[0]
+    axs[0].scatter(*Xdata.T, s=1)
+    axs[0].scatter(*Xdata_.T.numpy(), s=1)
+    axs[1].scatter(*Ydata.T.numpy(), s=1)
+
+    plt.figure()
+    delta = (Xdata - Xdata_.numpy()).ravel()
+    plt.hist(delta, bins=100)
+    plt.title(f"{np.sum(~np.isfinite(delta)):.0f} bad")
+
+    axs[0].set_title('Unbounded data')
+    axs[1].set_title('Bounded data')
+    plt.show()
+
