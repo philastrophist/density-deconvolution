@@ -33,7 +33,7 @@ class LowerBound(BatchedTransform):
         """
         from [1, 0] -> [l, +oo]
         """
-        x = -torch.log(inputs)
+        x = -torch.log(torch.clamp(inputs, self.eps, 1-self.eps))
         return self.lower + x, x  # |d/dx| is -log(|inputs|) but inputs is always positive, so simplify
 
 
@@ -54,7 +54,7 @@ class UpperBound(BatchedTransform):
         """
         from [0, 1] -> [-oo, u]
         """
-        y = torch.log(inputs)
+        y = torch.log(torch.clamp(inputs, self.eps, 1-self.eps))
         return y + self.upper, -y
 
 
@@ -81,7 +81,7 @@ class TwoSidedBound(BatchedTransform):
         """
         from [0, 1] -> [l, u]
         """
-        outputs = (inputs * self.scale) + self.lower
+        outputs = (torch.clamp(inputs, self.eps, 1-self.eps) * self.scale) + self.lower
         return outputs, self.logscale
 
 

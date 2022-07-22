@@ -44,7 +44,7 @@ class SVIFlow(MAFlow):
 
     def __init__(self, dimensions, flow_steps, lr, epochs, context_size=64, hidden_features=128,
                  batch_size=256, kl_warmup=0.2, kl_init_factor=0.5, kl_multiplier=4.,
-                 bounds=None, eps=1e-6, warmup=10,
+                 bounds=None, eps=1e-6, gradual_epochs=20, warmup=10, warmup_lr=1e-9,
                  n_samples=50, grad_clip_norm=None, use_iwae=False, use_diag_errs=False,
                  scheduler_kwargs=None, device=None):
         self.bounds = bounds
@@ -56,6 +56,8 @@ class SVIFlow(MAFlow):
         super().__init__(
             dimensions, flow_steps, lr, epochs, batch_size, device
         )
+        self.gradual_epochs = gradual_epochs
+        self.warmup_lr = lr if warmup_lr is None else warmup_lr
         self.context_size = context_size
         self.hidden_features = hidden_features
         self.kl_warmup = kl_warmup
@@ -75,18 +77,38 @@ class SVIFlow(MAFlow):
         )
 
         self.model.to(self.device)
-        self.optimiser = torch.optim.Adam(
-            params=self.model.parameters(),
-            lr=self.lr
-        )
-        _scheduler_kwargs = dict(factor=0.3,
-                                 patience=10,
-                                 verbose=True,
-                                 threshold=1e-4)
-        scheduler_kwargs = {} if self.scheduler_kwargs is None else self.scheduler_kwargs
-        _scheduler_kwargs.update(scheduler_kwargs)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimiser, mode='max', **_scheduler_kwargs)
-        self.scheduler = GradualWarmupScheduler(self.optimiser, multiplier=1, total_epoch=warmup, after_scheduler=scheduler)
+        self.warmup = warmup
+        self.setup_optimiser_scheduler(warmup_mode=True, gradual_increase=False)  # start at warmup_lr and dont increase
+
+    def setup_optimiser_scheduler(self, warmup_mode: bool, gradual_increase: bool):
+        if warmup_mode:
+            lr = self.warmup_lr
+        elif gradual_increase:
+            lr = 1e-11
+        else:
+            lr = self.lr
+        self.optimiser = torch.optim.Adam(params=self.model.parameters(), lr=lr)
+        if warmup_mode:
+            print(f"Entering warmup mode with lr={lr:.2g}")
+            scheduler = torch.optim.lr_scheduler.ConstantLR(self.optimiser, 1.)
+        else:
+            _scheduler_kwargs = dict(factor=0.8,
+                                     patience=10,
+                                     verbose=True,
+                                     threshold=1e-4)
+            scheduler_kwargs = {} if self.scheduler_kwargs is None else self.scheduler_kwargs
+            _scheduler_kwargs.update(scheduler_kwargs)
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimiser, mode='max', **_scheduler_kwargs)
+            if gradual_increase:
+                print(f"Gradually increasing lr from {lr:.2g} to {self.lr:.2g} over {self.gradual_epochs} epochs")
+                self.scheduler = GradualWarmupScheduler(self.optimiser, multiplier=self.lr / lr,
+                                                        total_epoch=self.gradual_epochs, after_scheduler=scheduler)
+            else:
+                print(f"Setting lr to {lr:.2g} now")
+        self.scheduler = scheduler
+
+
+
 
 
     def _create_prior(self):
@@ -180,6 +202,9 @@ class SVIFlow(MAFlow):
 
         for iepoch in bar:
             try:
+                if iepoch == self.warmup+1:
+                    # when
+                    self.setup_optimiser_scheduler(warmup_mode=False, gradual_increase=False)
                 self.model.train()
                 train_loss = 0.0
                 logls = 0.
@@ -210,7 +235,7 @@ class SVIFlow(MAFlow):
                     torch.set_default_tensor_type(torch.FloatTensor)
 
                     # minibatch_scaling = data.X.shape[0] / d[0].shape[0]
-                    objective = torch.clamp(objective, -1e+30, 1e+30).sum()
+                    objective = torch.clamp(objective, -1e+30, 1e+30)
                     train_loss += torch.sum(objective).item()
                     logls += torch.sum(logl).item()
                     kls += torch.sum(kl).item()
@@ -222,6 +247,7 @@ class SVIFlow(MAFlow):
                             self.grad_clip_norm
                         )
                     self.optimiser.step()
+                train_loss /= len(data)
                 logls /= len(data)
                 kls /= len(data)
 
@@ -243,10 +269,16 @@ class SVIFlow(MAFlow):
                         num_workers=num_workers
                     ) / len(val_data)
                     bar.desc = f'loss[train|val], logl, kl, lr: [{train_loss:.4f} | {val_loss:.4f}], {logls:.4f}, {kls:.4f}'
-                    self.scheduler.step(epoch=iepoch, metrics=val_loss)
+                    try:
+                        self.scheduler.step(epoch=iepoch, metrics=val_loss)
+                    except TypeError:
+                        self.scheduler.step(epoch=iepoch)
                 else:
                     bar.desc = f'loss[train], [logl|kl], lr: {train_loss:.4f}, {logls:.4f} | {kls:.4f}'
-                    self.scheduler.step(epoch=iepoch, metrics=train_loss)
+                    try:
+                        self.scheduler.step(epoch=iepoch, metrics=train_loss)
+                    except TypeError:
+                        self.scheduler.step(epoch=iepoch)
                 if return_kl_logl:
                     yield self, train_loss, val_loss, logls, kls
                 else:

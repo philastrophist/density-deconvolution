@@ -69,7 +69,7 @@ def random_catalogue_match_fields(real_catalogue, random_fluxes):
     return randomised.applymap(float), np.concatenate(selected)
 
 
-SEED = 12345
+SEED = 1234
 set_seed(SEED)
 
 
@@ -167,7 +167,7 @@ distmod = Planck18.distmod(overlapped['redshift']).value
 overlapped['cModelMag_r'] = 22.5 - 2.5 * np.log10(overlapped['cModelFlux_r'])  - distmod
 overlapped['cModelMagErr_r'] = np.abs(2.5 * 0.434 / np.sqrt(overlapped['cModelFluxIvar_r']) / overlapped['cModelFlux_r'])
 
-radio_flux_scaling = 1000.
+radio_flux_scaling = 1000.  #mJy
 
 Xdata = torch.tensor(np.stack([
     overlapped[data_flux_name] * radio_flux_scaling,
@@ -178,8 +178,8 @@ Xdata = torch.tensor(np.stack([
     overlapped.nii_6584_flux.values,
     overlapped.oiii_5007_flux.values,
     overlapped.D4000.values,
-    # overlapped.cModelFlux_r.values,
-    overlapped.cModelMag_r.values,
+    overlapped.cModelFlux_r.values,
+    # overlapped.cModelMag_r.values,
 
 ]).T.astype(np.float32))
 Xerr = torch.tensor(np.stack([
@@ -191,11 +191,11 @@ Xerr = torch.tensor(np.stack([
     overlapped['nii_6584_flux_err'].values,
     overlapped['oiii_5007_flux_err'].values,
     overlapped['D4000_ERR'].values,
-    overlapped['cModelMagErr_r'].values,
-    # np.sqrt(1 / overlapped['cModelFluxIvar_r'].values)  # gets squared later
+    # overlapped['cModelMagErr_r'].values,
+    np.sqrt(1 / overlapped['cModelFluxIvar_r'].values)  # gets squared later
 ]).T.astype(np.float32))
 
-varnames = ['f150', 'z', 'logM', 'ha', 'hb', 'nii', 'oiii', 'D4000', 'R']
+varnames = ['f150', 'z', 'logM', 'ha', 'hb', 'nii', 'oiii', 'D4000', 'r_flux']
 
 cov = torch.diag_embed(Xerr)**2.
 
@@ -349,12 +349,13 @@ model_bounds = np.array([
     [0.05, 0.085],
     [-np.inf, np.inf],
 ] + \
-    [[-np.inf, np.inf]]*6
+    [[-np.inf, np.inf]]*5 + \
+    [[0., np.inf]]
 )
 
 data_transforms = [radio_flux_transform, redshift_transform, mass_transform] + line_transforms + [d4000_transform, rflux_transform]
 
-selected_names = ['z', 'logM', 'D4000']
+selected_names = ['f150', 'z', 'logM', 'D4000']
 indexes = [varnames.index(i) for i in selected_names]
 
 Xdata = Xdata[:, indexes]
@@ -735,7 +736,7 @@ else:
     test_data = DeconvDataset(X_test, S_test, diag=True)
 
 # directory = Path('models/noisy-all-uncut-all-expect-f150')
-directory = Path('models/noisy-all-uncut-all-expect-f150-without-redshift')
+directory = Path('models/noisy-all-no-bounds-50_000-500-100')
 space_dir = directory / 'plots'
 params_dir = directory / 'params'
 directory.mkdir(parents=True, exist_ok=True)
@@ -743,17 +744,19 @@ space_dir.mkdir(parents=True, exist_ok=True)
 params_dir.mkdir(parents=True, exist_ok=True)
 print(f'saving to {directory}')
 
-total_epochs = 1000
+total_epochs = 50_000
 start_from = 0
 svi = MySVIFlow(
     Xdata.shape[1],
-    flow_steps=5,
+    flow_steps=4,
     device= torch.device('cpu'),
-    batch_size=1000,
+    batch_size=500,
     epochs=total_epochs,
-    lr=1e-3,
-    warmup=10,
-    n_samples=25,
+    warmup_lr=1e-3,
+    lr=1e-4,
+    warmup=3,
+    gradual_epochs=20,
+    n_samples=100,
     grad_clip_norm=100,
     bounds=data2fitting(torch.as_tensor(bounds, dtype=Xdata.dtype).T).T,
     kl_multiplier=1.,
